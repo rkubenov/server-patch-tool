@@ -1122,8 +1122,80 @@ function Update-ServerEntry {
 }
 
 # ── Server Operations ─────────────────────────────────────────────────────────
+# Shared tail for install jobs: Invoke-InstallServer and its sequential twin
+# differed only in what they did afterwards.
+function Complete-InstallResult {
+    param([string]$ServerName, $Result)
+
+    if ($Result.Success) {
+        $reboot  = if ($Result.RebootRequired) { "Yes" } else { "No" }
+        $status  = if ($Result.RebootRequired) { "Reboot Required" } else { "Up to date" }
+        $details = $Result.Message
+        if ($Result.FailedCount -gt 0) { $details += " ($($Result.FailedCount) failed)" }
+
+        Update-ServerEntry -ServerName $ServerName -Properties @{
+            Status         = $status
+            Installed      = $Result.InstalledCount.ToString()
+            Available      = "0"
+            RebootRequired = $reboot
+            Details        = $details
+        }
+        Write-Log "$ServerName : $($Result.Message)$(if($Result.RebootRequired){' - reboot required'})"
+    } else {
+        Update-ServerEntry -ServerName $ServerName -Properties @{
+            Status  = "Error"
+            Details = "Install error: $($Result.Error)"
+        }
+        Write-Log "$ServerName : Install failed - $($Result.Error)" "ERROR"
+    }
+    Step-Progress
+}
+
+# Shared tail for post-reboot monitor jobs. The single, sequential and parallel
+# reboot paths each carried an identical copy of this block, so every fix had
+# to be made in three places.
+function Complete-RebootMonitor {
+    param([string]$ServerName, $Monitor)
+
+    switch ($Monitor.Phase) {
+        "Online" {
+            Update-ServerEntry -ServerName $ServerName -Properties @{
+                Status         = "Back Online"
+                RebootRequired = "No"
+                Details        = "Server came back online at $(Get-Date -Format 'HH:mm:ss'). Re-scanning..."
+            }
+            Write-Log "$ServerName : Back online - starting post-reboot scan"
+            # -NoProgress: this rescan belongs to the reboot batch that is
+            # already being counted, not to a scan batch of its own.
+            Invoke-ScanServer -ServerName $ServerName -NoProgress
+        }
+        "Timeout" {
+            Update-ServerEntry -ServerName $ServerName -Properties @{
+                Status  = "Offline"
+                Details = "Server did not respond after reboot. $($Monitor.Error)"
+            }
+            Write-Log "$ServerName : Post-reboot timeout - server not responding" "WARN"
+        }
+        "WinRMTimeout" {
+            Update-ServerEntry -ServerName $ServerName -Properties @{
+                Status  = "Partially Online"
+                Details = "Server responds to ping but WinRM is not ready. $($Monitor.Error)"
+            }
+            Write-Log "$ServerName : Pingable but WinRM not ready" "WARN"
+        }
+        default {
+            Update-ServerEntry -ServerName $ServerName -Properties @{
+                Status  = "Error"
+                Details = "Post-reboot monitor error: $($Monitor.Error)"
+            }
+            Write-Log "$ServerName : Monitor error - $($Monitor.Error)" "ERROR"
+        }
+    }
+    Step-Progress
+}
+
 function Invoke-ScanServer {
-    param([string]$ServerName)
+    param([string]$ServerName, [switch]$NoProgress)
 
     if (-not (Ensure-Credential)) { return }
 
@@ -1166,7 +1238,7 @@ function Invoke-ScanServer {
             }
             Write-Log "$ServerName : $errMsg" "ERROR"
         }
-        Step-Progress
+        if (-not $NoProgress) { Step-Progress }
     }.GetNewClosure()
 }
 
@@ -1184,31 +1256,7 @@ function Invoke-InstallServer {
     $cred = Get-ServerCredential -ServerName $ServerName
     Start-AsyncJob -ScriptBlock $script:RunAsSystemScript -Arguments @($ServerName, $cred, $script:InstallPayload, $script:InstallTimeout, 'Install') -OnComplete {
         param($result)
-        $r = $result | Select-Object -First 1
-        if ($r.Success) {
-            $reboot = if ($r.RebootRequired) { "Yes" } else { "No" }
-            $status = if ($r.RebootRequired) { "Reboot Required" }
-                      elseif ($r.InstalledCount -gt 0) { "Up to date" }
-                      else { "Up to date" }
-            $details = $r.Message
-            if ($r.FailedCount -gt 0) { $details += " ($($r.FailedCount) failed)" }
-
-            Update-ServerEntry -ServerName $ServerName -Properties @{
-                Status         = $status
-                Installed      = $r.InstalledCount.ToString()
-                Available      = "0"
-                RebootRequired = $reboot
-                Details        = $details
-            }
-            Write-Log "$ServerName : $($r.Message)$(if($r.RebootRequired){' - reboot required'})"
-        } else {
-            Update-ServerEntry -ServerName $ServerName -Properties @{
-                Status  = "Error"
-                Details = "Install error: $($r.Error)"
-            }
-            Write-Log "$ServerName : Install failed - $($r.Error)" "ERROR"
-        }
-        Step-Progress
+        Complete-InstallResult -ServerName $ServerName -Result ($result | Select-Object -First 1)
     }.GetNewClosure()
 }
 
@@ -1247,35 +1295,7 @@ function Invoke-RebootServer {
             $monCred = Get-ServerCredential -ServerName $ServerName
             Start-AsyncJob -ScriptBlock $script:RebootMonitorScript -Arguments @($ServerName, $monCred, $r.BootBefore) -OnComplete {
                 param($monResult)
-                $m = $monResult | Select-Object -First 1
-                $phase = $m.Phase
-                if ($phase -eq "Online") {
-                    Update-ServerEntry -ServerName $ServerName -Properties @{
-                        Status         = "Back Online"
-                        RebootRequired = "No"
-                        Details        = "Server came back online at $(Get-Date -Format 'HH:mm:ss'). Re-scanning..."
-                    }
-                    Write-Log "$ServerName : Back online - starting post-reboot scan"
-                    Invoke-ScanServer -ServerName $ServerName
-                } elseif ($phase -eq "Timeout") {
-                    Update-ServerEntry -ServerName $ServerName -Properties @{
-                        Status  = "Offline"
-                        Details = "Server did not respond after reboot. $($m.Error)"
-                    }
-                    Write-Log "$ServerName : Post-reboot timeout - server not responding" "WARN"
-                } elseif ($phase -eq "WinRMTimeout") {
-                    Update-ServerEntry -ServerName $ServerName -Properties @{
-                        Status  = "Partially Online"
-                        Details = "Server responds to ping but WinRM is not ready. $($m.Error)"
-                    }
-                    Write-Log "$ServerName : Pingable but WinRM not ready" "WARN"
-                } else {
-                    Update-ServerEntry -ServerName $ServerName -Properties @{
-                        Status  = "Error"
-                        Details = "Post-reboot monitor error: $($m.Error)"
-                    }
-                    Write-Log "$ServerName : Monitor error - $($m.Error)" "ERROR"
-                }
+                Complete-RebootMonitor -ServerName $ServerName -Monitor ($monResult | Select-Object -First 1)
             }.GetNewClosure()
         } else {
             Update-ServerEntry -ServerName $ServerName -Properties @{
@@ -1480,32 +1500,7 @@ function Invoke-InstallServerSequential {
     $cred = Get-ServerCredential -ServerName $ServerName
     Start-AsyncJob -ScriptBlock $script:RunAsSystemScript -Arguments @($ServerName, $cred, $script:InstallPayload, $script:InstallTimeout, 'Install') -OnComplete {
         param($result)
-        $r = $result | Select-Object -First 1
-        if ($r.Success) {
-            $reboot = if ($r.RebootRequired) { "Yes" } else { "No" }
-            $status = if ($r.RebootRequired) { "Reboot Required" }
-                      elseif ($r.InstalledCount -gt 0) { "Up to date" }
-                      else { "Up to date" }
-            $details = $r.Message
-            if ($r.FailedCount -gt 0) { $details += " ($($r.FailedCount) failed)" }
-
-            Update-ServerEntry -ServerName $ServerName -Properties @{
-                Status         = $status
-                Installed      = $r.InstalledCount.ToString()
-                Available      = "0"
-                RebootRequired = $reboot
-                Details        = $details
-            }
-            Write-Log "$ServerName : $($r.Message)$(if($r.RebootRequired){' - reboot required'})"
-        } else {
-            Update-ServerEntry -ServerName $ServerName -Properties @{
-                Status  = "Error"
-                Details = "Install error: $($r.Error)"
-            }
-            Write-Log "$ServerName : Install failed - $($r.Error)" "ERROR"
-        }
-
-        Step-Progress
+        Complete-InstallResult -ServerName $ServerName -Result ($result | Select-Object -First 1)
 
         # Process next in queue
         if ($script:SequentialQueue.Count -gt 0) {
@@ -1620,35 +1615,7 @@ function Invoke-RebootServerSequential {
             $monCred = Get-ServerCredential -ServerName $ServerName
             Start-AsyncJob -ScriptBlock $script:RebootMonitorScript -Arguments @($ServerName, $monCred, $r.BootBefore) -OnComplete {
                 param($monResult)
-                $m = $monResult | Select-Object -First 1
-                $phase = $m.Phase
-                if ($phase -eq "Online") {
-                    Update-ServerEntry -ServerName $ServerName -Properties @{
-                        Status         = "Back Online"
-                        RebootRequired = "No"
-                        Details        = "Server came back online at $(Get-Date -Format 'HH:mm:ss'). Re-scanning..."
-                    }
-                    Write-Log "$ServerName : Back online - starting post-reboot scan"
-                    Invoke-ScanServer -ServerName $ServerName
-                } elseif ($phase -eq "Timeout") {
-                    Update-ServerEntry -ServerName $ServerName -Properties @{
-                        Status  = "Offline"
-                        Details = "Server did not respond after reboot. $($m.Error)"
-                    }
-                    Write-Log "$ServerName : Post-reboot timeout" "WARN"
-                } elseif ($phase -eq "WinRMTimeout") {
-                    Update-ServerEntry -ServerName $ServerName -Properties @{
-                        Status  = "Partially Online"
-                        Details = "Server responds to ping but WinRM not ready. $($m.Error)"
-                    }
-                    Write-Log "$ServerName : Pingable but WinRM not ready" "WARN"
-                } else {
-                    Update-ServerEntry -ServerName $ServerName -Properties @{
-                        Status  = "Error"
-                        Details = "Post-reboot monitor error: $($m.Error)"
-                    }
-                    Write-Log "$ServerName : Monitor error - $($m.Error)" "ERROR"
-                }
+                Complete-RebootMonitor -ServerName $ServerName -Monitor ($monResult | Select-Object -First 1)
 
                 # Process next in reboot queue
                 if ($script:RebootQueue.Count -gt 0) {
@@ -1714,35 +1681,7 @@ function Start-RebootParallel {
                 $monCred = Get-ServerCredential -ServerName $sn
                 Start-AsyncJob -ScriptBlock $script:RebootMonitorScript -Arguments @($sn, $monCred, $r.BootBefore) -OnComplete {
                     param($monResult)
-                    $m = $monResult | Select-Object -First 1
-                    $phase = $m.Phase
-                    if ($phase -eq "Online") {
-                        Update-ServerEntry -ServerName $sn -Properties @{
-                            Status         = "Back Online"
-                            RebootRequired = "No"
-                            Details        = "Server came back online at $(Get-Date -Format 'HH:mm:ss'). Re-scanning..."
-                        }
-                        Write-Log "$sn : Back online - starting post-reboot scan"
-                        Invoke-ScanServer -ServerName $sn
-                    } elseif ($phase -eq "Timeout") {
-                        Update-ServerEntry -ServerName $sn -Properties @{
-                            Status  = "Offline"
-                            Details = "Server did not respond after reboot. $($m.Error)"
-                        }
-                        Write-Log "$sn : Post-reboot timeout" "WARN"
-                    } elseif ($phase -eq "WinRMTimeout") {
-                        Update-ServerEntry -ServerName $sn -Properties @{
-                            Status  = "Partially Online"
-                            Details = "Server responds to ping but WinRM not ready. $($m.Error)"
-                        }
-                        Write-Log "$sn : Pingable but WinRM not ready" "WARN"
-                    } else {
-                        Update-ServerEntry -ServerName $sn -Properties @{
-                            Status  = "Error"
-                            Details = "Post-reboot monitor error: $($m.Error)"
-                        }
-                        Write-Log "$sn : Monitor error - $($m.Error)" "ERROR"
-                    }
+                    Complete-RebootMonitor -ServerName $sn -Monitor ($monResult | Select-Object -First 1)
                 }.GetNewClosure()
             } else {
                 Update-ServerEntry -ServerName $sn -Properties @{
