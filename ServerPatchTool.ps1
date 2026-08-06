@@ -19,6 +19,15 @@ Add-Type -AssemblyName System.Windows.Forms
 # ── Persistent server list file ──────────────────────────────────────────────
 $script:DataFile = Join-Path $PSScriptRoot "servers.json"
 
+# ── Log file ─────────────────────────────────────────────────────────────────
+# One file per day next to the script. The in-window log is cleared on close,
+# which left no record of what was patched during a change window.
+$script:LogDir  = Join-Path $PSScriptRoot "logs"
+$script:LogFile = Join-Path $script:LogDir ("ServerPatchTool_{0}.log" -f (Get-Date -Format 'yyyyMMdd'))
+if (-not (Test-Path -LiteralPath $script:LogDir)) {
+    New-Item -ItemType Directory -Path $script:LogDir -Force | Out-Null
+}
+
 # ── XAML UI Definition ────────────────────────────────────────────────────────
 [xml]$xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
@@ -466,11 +475,17 @@ function Load-ServerList {
 # ── Helpers ───────────────────────────────────────────────────────────────────
 function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
-    $ts = Get-Date -Format "HH:mm:ss"
+    $now = Get-Date
     $window.Dispatcher.Invoke([action]{
-        $ui.txtLog.AppendText("[$ts] $Level  $Message`r`n")
+        $ui.txtLog.AppendText("[$($now.ToString('HH:mm:ss'))] $Level  $Message`r`n")
         $ui.txtLog.ScrollToEnd()
     })
+    # Persist to disk as well, so the run leaves an audit trail. A failure to
+    # write must never take down the UI, hence the swallow.
+    try {
+        Add-Content -Path $script:LogFile -Encoding UTF8 -ErrorAction Stop `
+            -Value ("{0} {1,-5} {2}" -f $now.ToString('yyyy-MM-dd HH:mm:ss'), $Level, $Message)
+    } catch { }
 }
 
 function Update-StatusBar {
@@ -494,6 +509,28 @@ function Show-Progress {
         $ui.progressBar.Maximum = $Max
         $ui.progressBar.Value = $Value
     })
+}
+
+# Progress is tracked per batch. Show-Progress on its own was only ever called
+# with -Value 0, so the bar stayed empty for the entire run.
+$script:ProgressTotal = 0
+$script:ProgressDone  = 0
+
+function Start-ProgressBatch {
+    param([int]$Total)
+    $script:ProgressTotal = $Total
+    $script:ProgressDone  = 0
+    Show-Progress -Visible $true -Value 0 -Max $Total
+}
+
+function Step-Progress {
+    # Ad-hoc single operations (context menu, post-reboot rescan) run outside a
+    # batch and must not push the bar past its maximum.
+    if ($script:ProgressTotal -le 0) { return }
+    $script:ProgressDone++
+    Show-Progress -Visible $true -Max $script:ProgressTotal `
+                  -Value ([Math]::Min($script:ProgressDone, $script:ProgressTotal))
+    if ($script:ProgressDone -ge $script:ProgressTotal) { $script:ProgressTotal = 0 }
 }
 
 function New-ServerEntry {
@@ -1129,6 +1166,7 @@ function Invoke-ScanServer {
             }
             Write-Log "$ServerName : $errMsg" "ERROR"
         }
+        Step-Progress
     }.GetNewClosure()
 }
 
@@ -1170,6 +1208,7 @@ function Invoke-InstallServer {
             }
             Write-Log "$ServerName : Install failed - $($r.Error)" "ERROR"
         }
+        Step-Progress
     }.GetNewClosure()
 }
 
@@ -1252,10 +1291,11 @@ function Invoke-RebootServer {
 
 # Add servers
 $ui.btnAddServer.Add_Click({
-    $input = $ui.txtServerName.Text.Trim()
-    if (-not $input) { return }
+    # Not $input: that is an automatic variable holding the pipeline enumerator.
+    $entered = $ui.txtServerName.Text.Trim()
+    if (-not $entered) { return }
 
-    $names = $input -split '[,;\s]+' | Where-Object { $_ } | ForEach-Object { $_.Trim().ToUpper() }
+    $names = $entered -split '[,;\s]+' | Where-Object { $_ } | ForEach-Object { $_.Trim().ToUpper() }
     foreach ($name in $names) {
         if ($script:ServerData | Where-Object { $_.ServerName -eq $name }) {
             Write-Log "$name is already in the list" "WARN"
@@ -1400,7 +1440,7 @@ $ui.btnScanSelected.Add_Click({
         return
     }
 
-    Show-Progress -Visible $true -Value 0 -Max $servers.Count
+    Start-ProgressBatch -Total $servers.Count
     Update-StatusBar "Scanning $($servers.Count) selected server(s)..."
 
     foreach ($s in $servers) {
@@ -1414,7 +1454,7 @@ $ui.btnScanAll.Add_Click({
     $servers = @($script:ServerData)
     if ($servers.Count -eq 0) { return }
 
-    Show-Progress -Visible $true -Value 0 -Max $servers.Count
+    Start-ProgressBatch -Total $servers.Count
     Update-StatusBar "Scanning ALL $($servers.Count) server(s)..."
 
     foreach ($s in $servers) {
@@ -1465,6 +1505,8 @@ function Invoke-InstallServerSequential {
             Write-Log "$ServerName : Install failed - $($r.Error)" "ERROR"
         }
 
+        Step-Progress
+
         # Process next in queue
         if ($script:SequentialQueue.Count -gt 0) {
             $next = $script:SequentialQueue.Dequeue()
@@ -1492,6 +1534,16 @@ function Start-InstallBatch {
         return
     }
 
+    # A second click used to Clear() the queue mid-flight: the running chain
+    # lost its tail and two chains then advanced in parallel.
+    if ($script:SequentialRunning -or $script:RebootQueueRunning) {
+        [System.Windows.MessageBox]::Show(
+            "A sequential run is still in progress. Wait for it to finish before starting another.",
+            "Busy", "OK", "Information"
+        )
+        return
+    }
+
     $isSequential = $ui.rbSequential.IsChecked
     $modeLabel = if ($isSequential) { "sequentially (one-by-one)" } else { "in parallel" }
 
@@ -1503,7 +1555,7 @@ function Start-InstallBatch {
     )
     if ($confirm -ne "Yes") { return }
 
-    Show-Progress -Visible $true -Value 0 -Max $Servers.Count
+    Start-ProgressBatch -Total $Servers.Count
 
     if ($isSequential) {
         $script:SequentialQueue.Clear()
@@ -1714,6 +1766,16 @@ function Start-RebootBatch {
         return
     }
 
+    # See the note in Start-InstallBatch: the queue must not be rebuilt while a
+    # chain is still walking it.
+    if ($script:SequentialRunning -or $script:RebootQueueRunning) {
+        [System.Windows.MessageBox]::Show(
+            "A sequential run is still in progress. Wait for it to finish before starting another.",
+            "Busy", "OK", "Information"
+        )
+        return
+    }
+
     $isSequential = $ui.rbSequential.IsChecked
     $modeLabel = if ($isSequential) { "sequentially (one-by-one, waiting for each to come back)" } else { "in parallel (all at once)" }
 
@@ -1725,7 +1787,7 @@ function Start-RebootBatch {
     )
     if ($confirm -ne "Yes") { return }
 
-    Show-Progress -Visible $true -Value 0 -Max $Servers.Count
+    Start-ProgressBatch -Total $Servers.Count
 
     if ($isSequential) {
         $script:RebootQueue.Clear()
@@ -1781,10 +1843,13 @@ $ui.btnManageCredentials.Add_Click({
         [System.Windows.MessageBox]::Show("No credentials added yet.", "Manage Credentials", "OK", "Information")
         return
     }
-    $list = @($script:Credentials.Keys) | ForEach-Object {
-        $isDefault = if ($_ -eq $script:DefaultCredentialLabel) { " (default)" } else { "" }
-        $serverCount = @($script:ServerData | Where-Object { $_.CredentialLabel -eq $_ }).Count
-        "$_$isDefault - $serverCount server(s)"
+    # Inside the Where-Object, $_ is the server entry rather than the credential
+    # label, so the old one-liner compared an entry against itself and always
+    # reported 0 servers. Bind the label to a named variable instead.
+    $list = foreach ($label in @($script:Credentials.Keys)) {
+        $isDefault   = if ($label -eq $script:DefaultCredentialLabel) { " (default)" } else { "" }
+        $serverCount = @($script:ServerData | Where-Object { $_.CredentialLabel -eq $label }).Count
+        "$label$isDefault - $serverCount server(s)"
     }
     $msg = "Current credentials:`n`n$($list -join "`n")`n`nTo remove a credential, enter the username below (leave empty to cancel):"
     try {
