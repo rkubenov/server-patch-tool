@@ -619,8 +619,10 @@ Initialize-RunspacePool
 # Helper: the PowerShell code that will execute ON the remote server as SYSTEM
 # for scanning.  It writes JSON results to a well-known temp file.
 $script:ScanPayload = @'
-$logFile = "$env:TEMP\SPT_ScanLog.txt"
-function Log { param([string]$Msg) Add-Content -Path $logFile -Value "$(Get-Date -Format 'HH:mm:ss') $Msg" -Force }
+# $LogPath and $ResultPath are supplied by the runner as a prelude, so every
+# run writes to its own files and two operations against the same server
+# cannot overwrite or delete each other's results.
+function Log { param([string]$Msg) Add-Content -Path $LogPath -Value "$(Get-Date -Format 'HH:mm:ss') $Msg" -Force }
 
 try {
     Log "Starting Windows Update scan"
@@ -662,14 +664,15 @@ try {
         Error          = $_.Exception.Message
     }
 }
-$result | ConvertTo-Json -Depth 5 | Set-Content -Path "$env:TEMP\SPT_ScanResult.json" -Encoding UTF8 -Force
+$result | ConvertTo-Json -Depth 5 | Set-Content -Path $ResultPath -Encoding UTF8 -Force
 Log "Done"
 '@
 
 # Helper: PowerShell code for installing updates (runs as SYSTEM)
 $script:InstallPayload = @'
-$logFile = "$env:TEMP\SPT_InstallLog.txt"
-function Log { param([string]$Msg) Add-Content -Path $logFile -Value "$(Get-Date -Format 'HH:mm:ss') $Msg" -Force }
+# $LogPath and $ResultPath are supplied by the runner as a prelude - see the
+# note on $script:ScanPayload above.
+function Log { param([string]$Msg) Add-Content -Path $LogPath -Value "$(Get-Date -Format 'HH:mm:ss') $Msg" -Force }
 
 try {
     Log "Starting Windows Update install process"
@@ -771,68 +774,121 @@ try {
     }
 }
 Log "Writing result JSON"
-$result | ConvertTo-Json -Depth 5 | Set-Content -Path "$env:TEMP\SPT_InstallResult.json" -Encoding UTF8 -Force
+$result | ConvertTo-Json -Depth 5 | Set-Content -Path $ResultPath -Encoding UTF8 -Force
 Log "Done"
 '@
 
-# ── Scheduled-task wrapper that runs a payload as SYSTEM and reads results ────
+# -- Scheduled-task wrapper that runs a payload as SYSTEM and reads results ---
+# Creating a scheduled task is what gives the payload a SYSTEM token, and SYSTEM
+# always has access to the Windows Update Agent COM objects - a delegated
+# network token does not, which is the "Access denied" DCOM error this avoids.
+#
+# The payload, its log and its result file live in a directory writable only by
+# SYSTEM and Administrators. %SystemRoot%\Temp, used previously, is writable by
+# ordinary users: they could swap the script between the moment it is written
+# and the moment SYSTEM executes it, i.e. escalate to SYSTEM.
+#
+# Every run also gets its own file names, so a manual scan racing the automatic
+# post-reboot rescan can no longer read or delete the other's result file.
 $script:RunAsSystemScript = {
-    param([string]$ServerName, [PSCredential]$Credential, [string]$Payload, [string]$ResultFileName)
+    param(
+        [string]$ServerName,
+        [PSCredential]$Credential,
+        [string]$Payload,
+        [int]$TimeoutSeconds,
+        [string]$Operation
+    )
     try {
         $session = New-PSSession -ComputerName $ServerName -Credential $Credential -ErrorAction Stop
+        try {
+            $json = Invoke-Command -Session $session -ErrorAction Stop `
+                -ArgumentList $Payload, $TimeoutSeconds, $Operation -ScriptBlock {
+                param([string]$Code, [int]$Timeout, [string]$Op)
 
-        $result = Invoke-Command -Session $session -ArgumentList $Payload, $ResultFileName -ScriptBlock {
-            param([string]$Code, [string]$ResultFile)
+                # -- Work directory writable only by SYSTEM and Administrators --
+                $workDir = Join-Path $env:ProgramData 'ServerPatchTool'
+                if (-not (Test-Path -LiteralPath $workDir)) {
+                    New-Item -ItemType Directory -Path $workDir -Force | Out-Null
+                }
+                # Re-assert the ACL on every run: the directory may have been
+                # pre-created by someone else with looser permissions. Well-known
+                # SIDs are used so this also holds on localised Windows.
+                $sidSystem = [System.Security.Principal.SecurityIdentifier]'S-1-5-18'
+                $sidAdmins = [System.Security.Principal.SecurityIdentifier]'S-1-5-32-544'
+                $acl = Get-Acl -Path $workDir
+                $acl.SetAccessRuleProtection($true, $false)
+                foreach ($rule in @($acl.Access)) { $acl.RemoveAccessRule($rule) | Out-Null }
+                foreach ($sid in @($sidSystem, $sidAdmins)) {
+                    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                        $sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+                }
+                try { $acl.SetOwner($sidAdmins) } catch { }
+                Set-Acl -Path $workDir -AclObject $acl
 
-            $taskName   = "SPT_$(Get-Random)"
-            $resultPath = Join-Path $env:SystemRoot "Temp\$ResultFile"
+                # -- Per-run file names ---------------------------------------
+                $runId      = [guid]::NewGuid().ToString('N')
+                $taskName   = "SPT_${Op}_$runId"
+                $scriptPath = Join-Path $workDir "$runId.ps1"
+                $resultPath = Join-Path $workDir "$runId.result.json"
+                $logPath    = Join-Path $workDir "$runId.log"
 
-            # Write the payload to a temp .ps1 file
-            $scriptPath = Join-Path $env:SystemRoot "Temp\$taskName.ps1"
-            # Fix the result path in the payload (replace $env:TEMP with system temp)
-            $fixedCode = $Code -replace '\$env:TEMP', "$env:SystemRoot\Temp"
-            Set-Content -Path $scriptPath -Value $fixedCode -Encoding UTF8 -Force
+                # The payload reads $ResultPath and $LogPath. Supplying them as
+                # real variables is safer than rewriting the code with -replace.
+                $prelude = "`$ResultPath = '$resultPath'" + [Environment]::NewLine +
+                           "`$LogPath = '$logPath'" + [Environment]::NewLine
+                Set-Content -Path $scriptPath -Value ($prelude + $Code) -Encoding UTF8 -Force
 
-            # Create and run a scheduled task as SYSTEM
-            $action  = New-ScheduledTaskAction -Execute "powershell.exe" `
-                        -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`""
-            $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+                try {
+                    $action = New-ScheduledTaskAction -Execute "powershell.exe" `
+                                -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`""
+                    $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" `
+                                -LogonType ServiceAccount -RunLevel Highest
+                    Register-ScheduledTask -TaskName $taskName -Action $action `
+                                -Principal $principal -Force | Out-Null
+                    Start-ScheduledTask -TaskName $taskName
 
-            Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Force | Out-Null
-            Start-ScheduledTask -TaskName $taskName
+                    # Poll for the result file, not for task state alone: right
+                    # after Start-ScheduledTask the task can still report 'Ready',
+                    # and treating that as "finished" abandoned tasks that had
+                    # simply not started yet.
+                    $elapsed = 0
+                    $idle    = 0
+                    do {
+                        Start-Sleep -Seconds 2
+                        $elapsed += 2
+                        if (Test-Path -LiteralPath $resultPath) { break }
+                        $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+                        if ($task -and $task.State -eq 'Running') { $idle = 0 } else { $idle += 2 }
+                    } while ($elapsed -lt $Timeout -and $idle -lt 30)
 
-            # Wait for the task to complete (poll every 2 seconds, up to 30 min)
-            $maxWait = 1800  # seconds
-            $elapsed = 0
-            do {
-                Start-Sleep -Seconds 2
-                $elapsed += 2
-                $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-                $info = $task | Get-ScheduledTaskInfo -ErrorAction SilentlyContinue
-            } while ($task.State -eq 'Running' -and $elapsed -lt $maxWait)
+                    $diag = ""
+                    if (Test-Path -LiteralPath $logPath) {
+                        $diag = Get-Content -Path $logPath -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+                    }
 
-            # Cleanup the scheduled task and script file
-            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-            Remove-Item -Path $scriptPath -Force -ErrorAction SilentlyContinue
-
-            if ($elapsed -ge $maxWait) {
-                return @{ Success = $false; Error = "Operation timed out after 30 minutes" } | ConvertTo-Json
+                    if (Test-Path -LiteralPath $resultPath) {
+                        return (Get-Content -Path $resultPath -Raw -Encoding UTF8)
+                    }
+                    if ($elapsed -ge $Timeout) {
+                        return (@{
+                            Success = $false
+                            Error   = "$Op timed out after $([int]($Timeout / 60)) minutes. Log: $diag"
+                            Message = "Timed out"
+                        } | ConvertTo-Json -Depth 3)
+                    }
+                    $err = "Result file not created. "
+                    if ($diag) { $err += "Log: $diag" }
+                    else       { $err += "No diagnostic log found - the task may have failed to start." }
+                    return (@{ Success = $false; Error = $err; Message = "Task failed" } | ConvertTo-Json -Depth 3)
+                } finally {
+                    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+                    Remove-Item -Path $scriptPath, $resultPath, $logPath -Force -ErrorAction SilentlyContinue
+                }
             }
-
-            # Read the result JSON
-            if (Test-Path $resultPath) {
-                $json = Get-Content -Path $resultPath -Raw -Encoding UTF8
-                Remove-Item -Path $resultPath -Force -ErrorAction SilentlyContinue
-                return $json
-            } else {
-                return @{ Success = $false; Error = "Result file not found - task may have failed" } | ConvertTo-Json
-            }
-        } -ErrorAction Stop
-
-        Remove-PSSession $session -ErrorAction SilentlyContinue
-
-        # Parse the JSON result
-        return ($result | ConvertFrom-Json)
+        } finally {
+            Remove-PSSession $session -ErrorAction SilentlyContinue
+        }
+        return ($json | ConvertFrom-Json)
     } catch {
         return [PSCustomObject]@{
             Success        = $false
@@ -847,181 +903,105 @@ $script:RunAsSystemScript = {
     }
 }
 
-# Thin wrappers that feed the correct payload into the SYSTEM runner
-$script:ScanScript = {
-    param([string]$ServerName, [PSCredential]$Credential, [string]$Payload)
-    try {
-        $session = New-PSSession -ComputerName $ServerName -Credential $Credential -ErrorAction Stop
-        $result = Invoke-Command -Session $session -ArgumentList $Payload, "SPT_ScanResult.json" -ScriptBlock {
-            param([string]$Code, [string]$ResultFile)
+# Timeouts for the SYSTEM payloads, in seconds.
+$script:ScanTimeout    = 600    # 10 min
+$script:InstallTimeout = 1800   # 30 min
 
-            $taskName   = "SPT_$(Get-Random)"
-            $resultPath = Join-Path $env:SystemRoot "Temp\$ResultFile"
-            $scriptPath = Join-Path $env:SystemRoot "Temp\$taskName.ps1"
-            $fixedCode  = $Code -replace '\$env:TEMP', "$env:SystemRoot\Temp"
-            Set-Content -Path $scriptPath -Value $fixedCode -Encoding UTF8 -Force
-
-            $action    = New-ScheduledTaskAction -Execute "powershell.exe" `
-                          -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`""
-            $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-            Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Force | Out-Null
-            Start-ScheduledTask -TaskName $taskName
-
-            $maxWait = 600; $elapsed = 0
-            do {
-                Start-Sleep -Seconds 2; $elapsed += 2
-                $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-            } while ($task.State -eq 'Running' -and $elapsed -lt $maxWait)
-
-            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-            Remove-Item -Path $scriptPath -Force -ErrorAction SilentlyContinue
-
-            # Read diagnostic log if available
-            $diagLog = ""
-            $diagPath = Join-Path $env:SystemRoot "Temp\SPT_ScanLog.txt"
-            if (Test-Path $diagPath) {
-                $diagLog = Get-Content -Path $diagPath -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
-                Remove-Item -Path $diagPath -Force -ErrorAction SilentlyContinue
-            }
-
-            if ($elapsed -ge $maxWait) {
-                return (@{ Success = $false; Error = "Scan timed out after 10 minutes. Log: $diagLog" } | ConvertTo-Json -Depth 3)
-            }
-            if (Test-Path $resultPath) {
-                $json = Get-Content -Path $resultPath -Raw -Encoding UTF8
-                Remove-Item -Path $resultPath -Force -ErrorAction SilentlyContinue
-                return $json
-            } else {
-                $errMsg = "Result file not created. "
-                if ($diagLog) { $errMsg += "Log: $diagLog" } else { $errMsg += "No diagnostic log found - task may have crashed before starting." }
-                return (@{ Success = $false; Error = $errMsg } | ConvertTo-Json -Depth 3)
-            }
-        } -ErrorAction Stop
-
-        Remove-PSSession $session -ErrorAction SilentlyContinue
-        return ($result | ConvertFrom-Json)
-    } catch {
-        return [PSCustomObject]@{
-            Success = $false; Updates = @(); Count = 0
-            RebootRequired = $false; Error = $_.Exception.Message
-        }
-    }
-}
-
-$script:InstallScript = {
-    param([string]$ServerName, [PSCredential]$Credential, [string]$Payload)
-    try {
-        $session = New-PSSession -ComputerName $ServerName -Credential $Credential -ErrorAction Stop
-        $result = Invoke-Command -Session $session -ArgumentList $Payload, "SPT_InstallResult.json" -ScriptBlock {
-            param([string]$Code, [string]$ResultFile)
-
-            $taskName   = "SPT_$(Get-Random)"
-            $resultPath = Join-Path $env:SystemRoot "Temp\$ResultFile"
-            $scriptPath = Join-Path $env:SystemRoot "Temp\$taskName.ps1"
-            $fixedCode  = $Code -replace '\$env:TEMP', "$env:SystemRoot\Temp"
-            Set-Content -Path $scriptPath -Value $fixedCode -Encoding UTF8 -Force
-
-            $action    = New-ScheduledTaskAction -Execute "powershell.exe" `
-                          -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`""
-            $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-            Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Force | Out-Null
-            Start-ScheduledTask -TaskName $taskName
-
-            $maxWait = 1800; $elapsed = 0
-            do {
-                Start-Sleep -Seconds 2; $elapsed += 2
-                $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-            } while ($task.State -eq 'Running' -and $elapsed -lt $maxWait)
-
-            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-            Remove-Item -Path $scriptPath -Force -ErrorAction SilentlyContinue
-
-            # Read diagnostic log if available
-            $diagLog = ""
-            $diagPath = Join-Path $env:SystemRoot "Temp\SPT_InstallLog.txt"
-            if (Test-Path $diagPath) {
-                $diagLog = Get-Content -Path $diagPath -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
-                Remove-Item -Path $diagPath -Force -ErrorAction SilentlyContinue
-            }
-
-            if ($elapsed -ge $maxWait) {
-                return (@{ Success = $false; Error = "Install timed out after 30 minutes. Log: $diagLog"; Message = "Timed out" } | ConvertTo-Json -Depth 3)
-            }
-            if (Test-Path $resultPath) {
-                $json = Get-Content -Path $resultPath -Raw -Encoding UTF8
-                Remove-Item -Path $resultPath -Force -ErrorAction SilentlyContinue
-                return $json
-            } else {
-                $errMsg = "Result file not created. "
-                if ($diagLog) { $errMsg += "Log: $diagLog" } else { $errMsg += "No diagnostic log found - task may have crashed before starting." }
-                return (@{ Success = $false; Error = $errMsg; Message = "Task failed" } | ConvertTo-Json -Depth 3)
-            }
-        } -ErrorAction Stop
-
-        Remove-PSSession $session -ErrorAction SilentlyContinue
-        return ($result | ConvertFrom-Json)
-    } catch {
-        return [PSCustomObject]@{
-            Success = $false; InstalledCount = 0; FailedCount = 0
-            RebootRequired = $false; Error = $_.Exception.Message; Message = "Connection failed"
-        }
-    }
-}
-
-# Reboot script (no COM needed, so direct Restart-Computer works fine)
+# Reboot: triggers the restart and records the boot time beforehand, so the
+# monitor can later prove the machine really came back rather than guessing.
 $script:RebootScript = {
     param([string]$ServerName, [PSCredential]$Credential)
+    $bootBefore = $null
     try {
-        Restart-Computer -ComputerName $ServerName -Credential $Credential -Force -ErrorAction Stop
-        return [PSCustomObject]@{ Success = $true; Error = $null }
+        $session = New-PSSession -ComputerName $ServerName -Credential $Credential -ErrorAction Stop
+        try {
+            $bootBefore = Invoke-Command -Session $session -ErrorAction Stop -ScriptBlock {
+                (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime
+            }
+        } finally {
+            Remove-PSSession $session -ErrorAction SilentlyContinue
+        }
+
+        # -Protocol WSMan keeps the reboot on the same channel as everything
+        # else. The -ComputerName default is DCOM/RPC, which is routinely
+        # blocked on servers where WinRM (5985) is open, so reboots failed on
+        # hosts that scanned and patched fine.
+        Restart-Computer -ComputerName $ServerName -Credential $Credential `
+                         -Protocol WSMan -Force -ErrorAction Stop
+        return [PSCustomObject]@{ Success = $true; Error = $null; BootBefore = $bootBefore }
     } catch {
-        return [PSCustomObject]@{ Success = $false; Error = $_.Exception.Message }
+        return [PSCustomObject]@{ Success = $false; Error = $_.Exception.Message; BootBefore = $bootBefore }
     }
 }
 
-# Post-reboot monitor: waits for the server to go offline, come back, then
-# verifies WinRM connectivity.  Returns phase updates so the UI can reflect
-# the real-time state (Rebooting → Waiting → Back Online).
+# Post-reboot monitor. Confirms the reboot by watching for a NEW boot time.
+#
+# The previous version waited for the server to stop pinging, with a 120 s cap,
+# and then fell through without an error if it was still up - which happens
+# routinely when a server spends several minutes on "Working on updates" before
+# it actually goes down. It then connected to the still-running pre-reboot OS
+# and reported "Back Online", clearing RebootRequired and, in sequential mode,
+# releasing the queue early.
+#
+# Comparing boot times removes that race and also makes the monitor tolerant of
+# starting late (e.g. queued behind other jobs in the runspace pool): it does
+# not need to observe the downtime window itself.
 $script:RebootMonitorScript = {
-    param([string]$ServerName, [PSCredential]$Credential)
-    try {
-        # Phase 1 - wait for the server to stop responding (it is shutting down)
-        $maxDown = 120   # seconds to wait for it to go offline
-        $elapsed = 0
-        while ($elapsed -lt $maxDown) {
-            $ping = Test-Connection -ComputerName $ServerName -Count 1 -Quiet -ErrorAction SilentlyContinue
-            if (-not $ping) { break }
-            Start-Sleep -Seconds 3
-            $elapsed += 3
-        }
+    param([string]$ServerName, [PSCredential]$Credential, $BootBefore)
 
-        # Phase 2 - wait for the server to respond to ping again
-        $maxUp = 600   # up to 10 min for it to come back
-        $elapsed = 0
-        while ($elapsed -lt $maxUp) {
-            $ping = Test-Connection -ComputerName $ServerName -Count 1 -Quiet -ErrorAction SilentlyContinue
-            if ($ping) { break }
-            Start-Sleep -Seconds 5
-            $elapsed += 5
-        }
-        if ($elapsed -ge $maxUp) {
-            return [PSCustomObject]@{ Phase = "Timeout"; Error = "Server did not respond to ping within 10 minutes" }
-        }
-
-        # Phase 3 - wait for WinRM to become ready (OS may be booting / applying updates)
-        $maxWinRM = 300  # 5 min
-        $elapsed = 0
-        while ($elapsed -lt $maxWinRM) {
+    # Probe over WinRM rather than ICMP: ping is commonly blocked by policy on
+    # servers, and that made the old monitor report healthy hosts as offline.
+    # Returns the remote boot time, or $null when unreachable.
+    $probe = {
+        param([string]$Name, [PSCredential]$Cred)
+        try {
+            $s = New-PSSession -ComputerName $Name -Credential $Cred -ErrorAction Stop
             try {
-                $session = New-PSSession -ComputerName $ServerName -Credential $Credential -ErrorAction Stop
-                Remove-PSSession $session -ErrorAction SilentlyContinue
+                return Invoke-Command -Session $s -ErrorAction Stop -ScriptBlock {
+                    (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime
+                }
+            } finally { Remove-PSSession $s -ErrorAction SilentlyContinue }
+        } catch { return $null }
+    }
+
+    try {
+        # Cumulative updates applied during shutdown/startup can take a while.
+        $deadline = (Get-Date).AddMinutes(30)
+        $sawDown  = $false
+
+        while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 10
+            $boot = & $probe $ServerName $Credential
+
+            if ($null -eq $boot) {
+                # Unreachable: shutting down, or still booting.
+                $sawDown = $true
+                continue
+            }
+            if ($BootBefore) {
+                if ([datetime]$boot -ne [datetime]$BootBefore) {
+                    return [PSCustomObject]@{ Phase = "Online"; Error = $null }
+                }
+                # Reachable with the same boot time: shutdown has not begun yet.
+            } elseif ($sawDown) {
+                # No baseline was captured - fall back to down-then-up.
                 return [PSCustomObject]@{ Phase = "Online"; Error = $null }
-            } catch {
-                Start-Sleep -Seconds 5
-                $elapsed += 5
             }
         }
-        return [PSCustomObject]@{ Phase = "WinRMTimeout"; Error = "Server is pingable but WinRM not ready after 5 minutes" }
+
+        # Timed out. The ping here is diagnostic only, never a gate: it just
+        # distinguishes "box is up, WinRM is not" from "box is gone".
+        $pingable = Test-Connection -ComputerName $ServerName -Count 2 -Quiet -ErrorAction SilentlyContinue
+        if ($pingable) {
+            return [PSCustomObject]@{
+                Phase = "WinRMTimeout"
+                Error = "Server answers ping but no completed reboot was confirmed within 30 minutes"
+            }
+        }
+        return [PSCustomObject]@{
+            Phase = "Timeout"
+            Error = "Server did not come back within 30 minutes"
+        }
     } catch {
         return [PSCustomObject]@{ Phase = "Error"; Error = $_.Exception.Message }
     }
@@ -1117,7 +1097,7 @@ function Invoke-ScanServer {
     Write-Log "Scanning $ServerName for updates..."
 
     $cred = Get-ServerCredential -ServerName $ServerName
-    Start-AsyncJob -ScriptBlock $script:ScanScript -Arguments @($ServerName, $cred, $script:ScanPayload) -OnComplete {
+    Start-AsyncJob -ScriptBlock $script:RunAsSystemScript -Arguments @($ServerName, $cred, $script:ScanPayload, $script:ScanTimeout, 'Scan') -OnComplete {
         param($result)
         $r = $result | Select-Object -First 1
         if ($r.Success) {
@@ -1164,7 +1144,7 @@ function Invoke-InstallServer {
     Write-Log "Installing updates on $ServerName..."
 
     $cred = Get-ServerCredential -ServerName $ServerName
-    Start-AsyncJob -ScriptBlock $script:InstallScript -Arguments @($ServerName, $cred, $script:InstallPayload) -OnComplete {
+    Start-AsyncJob -ScriptBlock $script:RunAsSystemScript -Arguments @($ServerName, $cred, $script:InstallPayload, $script:InstallTimeout, 'Install') -OnComplete {
         param($result)
         $r = $result | Select-Object -First 1
         if ($r.Success) {
@@ -1226,7 +1206,7 @@ function Invoke-RebootServer {
 
             # Launch the post-reboot monitor
             $monCred = Get-ServerCredential -ServerName $ServerName
-            Start-AsyncJob -ScriptBlock $script:RebootMonitorScript -Arguments @($ServerName, $monCred) -OnComplete {
+            Start-AsyncJob -ScriptBlock $script:RebootMonitorScript -Arguments @($ServerName, $monCred, $r.BootBefore) -OnComplete {
                 param($monResult)
                 $m = $monResult | Select-Object -First 1
                 $phase = $m.Phase
@@ -1458,7 +1438,7 @@ function Invoke-InstallServerSequential {
     Write-Log "Installing updates on $ServerName (sequential mode)..."
 
     $cred = Get-ServerCredential -ServerName $ServerName
-    Start-AsyncJob -ScriptBlock $script:InstallScript -Arguments @($ServerName, $cred, $script:InstallPayload) -OnComplete {
+    Start-AsyncJob -ScriptBlock $script:RunAsSystemScript -Arguments @($ServerName, $cred, $script:InstallPayload, $script:InstallTimeout, 'Install') -OnComplete {
         param($result)
         $r = $result | Select-Object -First 1
         if ($r.Success) {
@@ -1586,7 +1566,7 @@ function Invoke-RebootServerSequential {
             Write-Log "$ServerName : Reboot initiated - monitoring until back online"
 
             $monCred = Get-ServerCredential -ServerName $ServerName
-            Start-AsyncJob -ScriptBlock $script:RebootMonitorScript -Arguments @($ServerName, $monCred) -OnComplete {
+            Start-AsyncJob -ScriptBlock $script:RebootMonitorScript -Arguments @($ServerName, $monCred, $r.BootBefore) -OnComplete {
                 param($monResult)
                 $m = $monResult | Select-Object -First 1
                 $phase = $m.Phase
@@ -1680,7 +1660,7 @@ function Start-RebootParallel {
                 Write-Log "$sn : Reboot initiated - monitoring until back online"
 
                 $monCred = Get-ServerCredential -ServerName $sn
-                Start-AsyncJob -ScriptBlock $script:RebootMonitorScript -Arguments @($sn, $monCred) -OnComplete {
+                Start-AsyncJob -ScriptBlock $script:RebootMonitorScript -Arguments @($sn, $monCred, $r.BootBefore) -OnComplete {
                     param($monResult)
                     $m = $monResult | Select-Object -First 1
                     $phase = $m.Phase
