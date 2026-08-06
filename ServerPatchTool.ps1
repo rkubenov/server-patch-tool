@@ -179,6 +179,15 @@ if (-not (Test-Path -LiteralPath $script:LogDir)) {
             <Setter Property="Padding" Value="6,4"/>
         </Style>
 
+        <!-- Without this the dropdown items keep the system's light background
+             and the light foreground above becomes unreadable. -->
+        <Style TargetType="ComboBoxItem">
+            <Setter Property="Background" Value="#313244"/>
+            <Setter Property="Foreground" Value="#cdd6f4"/>
+            <Setter Property="Padding" Value="6,3"/>
+            <Setter Property="FontSize" Value="13"/>
+        </Style>
+
         <Style TargetType="CheckBox">
             <Setter Property="Foreground" Value="#cdd6f4"/>
             <Setter Property="FontSize" Value="13"/>
@@ -308,6 +317,19 @@ if (-not (Test-Path -LiteralPath $script:LogDir)) {
                                          ToolTip="Update servers one-by-one, waiting for each to finish before starting the next"/>
                         </StackPanel>
                     </Border>
+                    <TextBlock Text="Max parallel:" Foreground="#a6adc8" VerticalAlignment="Center"
+                               Margin="10,0,4,0" FontSize="12"/>
+                    <ComboBox x:Name="cboParallel" Width="58" VerticalAlignment="Center"
+                              SelectedIndex="3"
+                              ToolTip="How many servers may be worked on at the same time in Parallel mode">
+                        <ComboBoxItem Content="1"/>
+                        <ComboBoxItem Content="2"/>
+                        <ComboBoxItem Content="5"/>
+                        <ComboBoxItem Content="10"/>
+                        <ComboBoxItem Content="15"/>
+                        <ComboBoxItem Content="20"/>
+                        <ComboBoxItem Content="30"/>
+                    </ComboBox>
                     <Border Width="1" Background="#45475a" Margin="8,2"/>
                     <Button x:Name="btnScanSelected" Content="Scan Selected" Style="{StaticResource AccentButton}"
                             ToolTip="Check for updates on checked servers only"/>
@@ -324,6 +346,9 @@ if (-not (Test-Path -LiteralPath $script:LogDir)) {
                             ToolTip="Reboot ALL servers that require it"/>
                     <Border Width="1" Background="#45475a" Margin="8,2"/>
                     <Button x:Name="btnExportCSV" Content="Export" ToolTip="Export results to CSV"/>
+                    <Button x:Name="btnStop" Content="Stop" Style="{StaticResource DangerButton}"
+                            IsEnabled="False"
+                            ToolTip="Stop queued work and stop monitoring. Work already sent to a server cannot be recalled."/>
                 </StackPanel>
             </Grid>
         </Border>
@@ -638,14 +663,35 @@ function Ensure-Credential {
 }
 
 # ── Initialize Runspace Pool ─────────────────────────────────────────────────
+# How many servers may be worked on at the same time. Was hardcoded to 10,
+# which is too many for a thin link and too few for a large estate.
+$script:RunspacePoolSize = 10
+
 function Initialize-RunspacePool {
+    param([int]$MaxThreads = 10)
     if ($script:RunspacePool) { $script:RunspacePool.Dispose() }
     $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
-    $script:RunspacePool = [RunspaceFactory]::CreateRunspacePool(1, 10, $iss, [System.Management.Automation.Host.PSHost]$Host)
+    $script:RunspacePool = [RunspaceFactory]::CreateRunspacePool(1, $MaxThreads, $iss, [System.Management.Automation.Host.PSHost]$Host)
     $script:RunspacePool.ApartmentState = "STA"
     $script:RunspacePool.Open()
+    $script:RunspacePoolSize = $MaxThreads
 }
-Initialize-RunspacePool
+Initialize-RunspacePool -MaxThreads $script:RunspacePoolSize
+
+# Applies the "Max parallel" box. A pool cannot be resized while it still holds
+# work, so this runs at the start of each batch rather than on selection change.
+function Sync-RunspacePool {
+    if (-not $ui.cboParallel.SelectedItem) { return }
+    $desired = [int]$ui.cboParallel.SelectedItem.Content
+    if ($desired -lt 1) { $desired = 1 }
+    if ($desired -eq $script:RunspacePoolSize) { return }
+    if ($script:ActiveJobs.Count -gt 0) {
+        Write-Log "Max parallel stays at $($script:RunspacePoolSize) until the current operations finish" "WARN"
+        return
+    }
+    Initialize-RunspacePool -MaxThreads $desired
+    Write-Log "Max parallel set to $desired"
+}
 
 # ── Remote Operations ─────────────────────────────────────────────────────────
 # Uses scheduled-task approach: creates a temporary task that runs as SYSTEM on
@@ -1096,6 +1142,11 @@ $script:JobTimer.Add_Tick({
     if ($script:ActiveJobs.Count -eq 0) {
         Show-Progress -Visible $false
     }
+
+    # Stop is only meaningful while there is something to stop.
+    $ui.btnStop.IsEnabled = ($script:ActiveJobs.Count -gt 0 -or
+                             $script:SequentialQueue.Count -gt 0 -or
+                             $script:RebootQueue.Count -gt 0)
 })
 $script:JobTimer.Start()
 
@@ -1192,6 +1243,57 @@ function Complete-RebootMonitor {
         }
     }
     Step-Progress
+}
+
+# Stops this tool from starting or watching anything further.
+#
+# It cannot recall work already handed to a server: an install that has begun
+# runs to completion under its own scheduled task, and a reboot that has been
+# issued still happens. Statuses below say so rather than claiming everything
+# was cancelled.
+function Stop-AllOperations {
+    # Empty the queues first, so no completion handler can start the next server.
+    $script:SequentialQueue.Clear()
+    $script:RebootQueue.Clear()
+    $script:SequentialRunning  = $false
+    $script:RebootQueueRunning = $false
+
+    $stopped = $script:ActiveJobs.Count
+    foreach ($job in @($script:ActiveJobs)) {
+        try { $job.PowerShell.Stop() }    catch { }
+        try { $job.PowerShell.Dispose() } catch { }
+    }
+    $script:ActiveJobs.Clear()
+
+    $script:ProgressTotal = 0
+    $script:ProgressDone  = 0
+    Show-Progress -Visible $false
+
+    foreach ($s in @($script:ServerData)) {
+        switch -Wildcard ($s.Status) {
+            "Scanning*" {
+                Update-ServerEntry -ServerName $s.ServerName -Properties @{
+                    Status  = "Cancelled"
+                    Details = "Scan cancelled"
+                }
+            }
+            "Installing*" {
+                Update-ServerEntry -ServerName $s.ServerName -Properties @{
+                    Status  = "Cancelled"
+                    Details = "Stopped watching. The install may still be running on the server - rescan to see the result."
+                }
+            }
+            "Rebooting*" {
+                Update-ServerEntry -ServerName $s.ServerName -Properties @{
+                    Status  = "Rebooting (unmonitored)"
+                    Details = "Reboot was already issued. Monitoring stopped - rescan once the server is back."
+                }
+            }
+        }
+    }
+
+    Update-StatusBar "Stopped"
+    Write-Log "Stopped by user: $stopped job(s) cancelled, queues cleared" "WARN"
 }
 
 function Invoke-ScanServer {
@@ -1460,6 +1562,7 @@ $ui.btnScanSelected.Add_Click({
         return
     }
 
+    Sync-RunspacePool
     Start-ProgressBatch -Total $servers.Count
     Update-StatusBar "Scanning $($servers.Count) selected server(s)..."
 
@@ -1474,6 +1577,7 @@ $ui.btnScanAll.Add_Click({
     $servers = @($script:ServerData)
     if ($servers.Count -eq 0) { return }
 
+    Sync-RunspacePool
     Start-ProgressBatch -Total $servers.Count
     Update-StatusBar "Scanning ALL $($servers.Count) server(s)..."
 
@@ -1550,6 +1654,7 @@ function Start-InstallBatch {
     )
     if ($confirm -ne "Yes") { return }
 
+    Sync-RunspacePool
     Start-ProgressBatch -Total $Servers.Count
 
     if ($isSequential) {
@@ -1726,6 +1831,7 @@ function Start-RebootBatch {
     )
     if ($confirm -ne "Yes") { return }
 
+    Sync-RunspacePool
     Start-ProgressBatch -Total $Servers.Count
 
     if ($isSequential) {
@@ -1901,6 +2007,21 @@ $ui.ctxRemove.Add_Click({
         Update-ServerCount
         Save-ServerList
     }
+})
+
+# Stop everything
+$ui.btnStop.Add_Click({
+    if ($script:ActiveJobs.Count -eq 0 -and
+        $script:SequentialQueue.Count -eq 0 -and
+        $script:RebootQueue.Count -eq 0) { return }
+
+    $confirm = [System.Windows.MessageBox]::Show(
+        "Stop all operations?`n`nServers still queued will not be started, and monitoring will stop.`n`nWork already sent to a server cannot be recalled: an install that has begun will finish on its own, and a reboot that has been issued will still happen.",
+        "Confirm Stop",
+        [System.Windows.MessageBoxButton]::YesNo,
+        [System.Windows.MessageBoxImage]::Warning
+    )
+    if ($confirm -eq "Yes") { Stop-AllOperations }
 })
 
 # Clear log
