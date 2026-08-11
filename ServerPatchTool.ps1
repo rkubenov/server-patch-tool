@@ -19,6 +19,12 @@ Add-Type -AssemblyName System.Windows.Forms
 # ── Persistent server list file ──────────────────────────────────────────────
 $script:DataFile = Join-Path $PSScriptRoot "servers.json"
 
+# Credentials live under the user profile rather than next to the script: the
+# DPAPI blob is scoped to this Windows account, so the file belongs with the
+# account, not with a tool folder that may sit on a share.
+$script:CredDir  = Join-Path $env:LOCALAPPDATA "ServerPatchTool"
+$script:CredFile = Join-Path $script:CredDir "credentials.json"
+
 # ── Log file ─────────────────────────────────────────────────────────────────
 # One file per day next to the script. The in-window log is cleared on close,
 # which left no record of what was patched during a change window.
@@ -272,6 +278,9 @@ if (-not (Test-Path -LiteralPath $script:LogDir)) {
                 <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
                     <TextBlock x:Name="txtCredentialStatus" Text="No credentials"
                                Foreground="#f38ba8" VerticalAlignment="Center" Margin="0,0,10,0" FontSize="13"/>
+                    <CheckBox x:Name="chkRememberCredentials" Content="Remember"
+                              Margin="0,0,10,0" FontSize="12" VerticalAlignment="Center"
+                              ToolTip="Save credentials for the next launch. Encrypted for your Windows account on this computer only - the file is useless elsewhere."/>
                     <Button x:Name="btnAddCredential" Content="Add Credential" FontSize="12"
                             ToolTip="Add a new credential set (domain\username)"/>
                     <Button x:Name="btnManageCredentials" Content="Manage" FontSize="12"
@@ -465,10 +474,24 @@ $script:SequentialRunning = $false
 
 # ── Persistent Storage ────────────────────────────────────────────────────────
 function Save-ServerList {
+    # Scan results are persisted too, so a restart no longer wipes the picture
+    # of the estate. LastScan travels with them, which is what tells the user
+    # how stale the numbers are.
     $data = @($script:ServerData | ForEach-Object {
-        @{ Name = $_.ServerName; Credential = $_.CredentialLabel }
+        @{
+            Name           = $_.ServerName
+            Credential     = $_.CredentialLabel
+            Selected       = [bool]$_.Selected
+            Status         = $_.Status
+            Available      = $_.Available
+            Installed      = $_.Installed
+            RebootRequired = $_.RebootRequired
+            LastScan       = $_.LastScan
+            Details        = $_.Details
+            UpdateList     = $_.UpdateList
+        }
     })
-    $data | ConvertTo-Json -Depth 3 | Set-Content -Path $script:DataFile -Encoding UTF8 -Force
+    $data | ConvertTo-Json -Depth 5 | Set-Content -Path $script:DataFile -Encoding UTF8 -Force
 }
 
 function Load-ServerList {
@@ -486,10 +509,34 @@ function Load-ServerList {
                     $credLabel = if ($item.Credential) { $item.Credential } else { "" }
                 }
                 if ($name -and -not ($script:ServerData | Where-Object { $_.ServerName -eq $name })) {
-                    $script:ServerData.Add((New-ServerEntry -Name $name -CredLabel $credLabel))
+                    $entry = New-ServerEntry -Name $name -CredLabel $credLabel
+
+                    if ($item -isnot [string]) {
+                        if ($null -ne $item.Selected)  { $entry.Selected       = [bool]$item.Selected }
+                        if ($item.Status)              { $entry.Status         = $item.Status }
+                        if ($item.Available)           { $entry.Available      = $item.Available }
+                        if ($item.Installed)           { $entry.Installed      = $item.Installed }
+                        if ($item.RebootRequired)      { $entry.RebootRequired = $item.RebootRequired }
+                        if ($item.LastScan)            { $entry.LastScan       = $item.LastScan }
+                        if ($item.Details)             { $entry.Details        = $item.Details }
+                        if ($item.UpdateList)          { $entry.UpdateList     = @($item.UpdateList) }
+
+                        # A status like "Installing..." only means something
+                        # while a job is behind it. After a restart there is
+                        # none, so say the operation was interrupted rather
+                        # than imply work is still in flight.
+                        if ($entry.Status -like "Scanning*" -or
+                            $entry.Status -like "Installing*" -or
+                            $entry.Status -like "Rebooting*") {
+                            $entry.Details = "Tool was closed during '$($entry.Status)'. Rescan to get the current state."
+                            $entry.Status  = "Interrupted"
+                        }
+                    }
+
+                    $script:ServerData.Add($entry)
                 }
             }
-            Write-Log "Loaded $($raw.Count) server(s) from saved list"
+            Write-Log "Loaded $(@($raw).Count) server(s) from saved list"
         } catch {
             Write-Log "Failed to load saved server list: $($_.Exception.Message)" "WARN"
         }
@@ -595,6 +642,82 @@ function Get-StatusColor {
     }
 }
 
+# ── Saved credentials (DPAPI) ────────────────────────────────────────────────
+# ConvertFrom-SecureString protects the password with DPAPI under the current
+# user, so the stored blob is worthless to any other Windows account and on any
+# other machine. It is NOT protection against this account: anything running as
+# this user on this PC can decrypt it, which is why saving is opt-in.
+function Save-Credentials {
+    if (-not $ui.chkRememberCredentials.IsChecked) { return }
+    try {
+        if (-not (Test-Path -LiteralPath $script:CredDir)) {
+            New-Item -ItemType Directory -Path $script:CredDir -Force | Out-Null
+        }
+        $data = @(foreach ($label in @($script:Credentials.Keys)) {
+            $c = $script:Credentials[$label]
+            @{
+                UserName  = $c.UserName
+                Password  = ($c.Password | ConvertFrom-SecureString)
+                IsDefault = ($label -eq $script:DefaultCredentialLabel)
+            }
+        })
+        $data | ConvertTo-Json -Depth 3 | Set-Content -Path $script:CredFile -Encoding UTF8 -Force
+    } catch {
+        Write-Log "Could not save credentials: $($_.Exception.Message)" "WARN"
+    }
+}
+
+function Load-Credentials {
+    if (-not (Test-Path -LiteralPath $script:CredFile)) { return $false }
+    try {
+        $raw = Get-Content -LiteralPath $script:CredFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        foreach ($item in @($raw)) {
+            if (-not $item.UserName -or -not $item.Password) { continue }
+            $sec  = ConvertTo-SecureString $item.Password -ErrorAction Stop
+            $cred = New-Object System.Management.Automation.PSCredential($item.UserName, $sec)
+            $script:Credentials[$item.UserName] = $cred
+            if ($item.IsDefault -or -not $script:DefaultCredentialLabel) {
+                $script:DefaultCredentialLabel = $item.UserName
+            }
+        }
+    } catch {
+        # Normally means the file was written by a different Windows account or
+        # copied from another machine, so DPAPI refuses to unprotect it.
+        Write-Log "Saved credentials could not be decrypted - please re-enter them" "WARN"
+        $script:Credentials.Clear()
+        $script:DefaultCredentialLabel = $null
+        Remove-SavedCredentials
+        return $false
+    }
+    if ($script:Credentials.Count -gt 0) {
+        Update-CredentialStatus
+        Write-Log "Restored $($script:Credentials.Count) saved credential(s)"
+        return $true
+    }
+    return $false
+}
+
+function Remove-SavedCredentials {
+    if (Test-Path -LiteralPath $script:CredFile) {
+        Remove-Item -LiteralPath $script:CredFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# Reloads the window log from today's file. Must run before this session writes
+# anything, otherwise the session's own lines get read back and duplicated.
+function Restore-LogWindow {
+    param([int]$MaxLines = 200)
+    if (-not (Test-Path -LiteralPath $script:LogFile)) { return }
+    try {
+        $lines = @(Get-Content -LiteralPath $script:LogFile -Encoding UTF8 -ErrorAction Stop)
+        if ($lines.Count -eq 0) { return }
+        $tail = if ($lines.Count -gt $MaxLines) { $lines[(-$MaxLines)..-1] } else { $lines }
+        $ui.txtLog.AppendText(($tail -join "`r`n") + "`r`n")
+        $ui.txtLog.AppendText("----- above restored from $($script:LogFile) -----`r`n")
+        $ui.txtLog.ScrollToEnd()
+    } catch { }
+}
+
 function Add-CredentialSet {
     param([string]$Message = "Enter credentials (domain\username)")
     $cred = Get-Credential -Message $Message
@@ -613,6 +736,7 @@ function Add-CredentialSet {
             $ui.dgServers.Items.Refresh()
         }
         Update-CredentialStatus
+        Save-Credentials
         Write-Log "Added credential: $label"
         return $label
     }
@@ -2024,6 +2148,18 @@ $ui.btnStop.Add_Click({
     if ($confirm -eq "Yes") { Stop-AllOperations }
 })
 
+# Remember credentials on/off. Unchecking deletes the stored file straight
+# away rather than at exit, so the secret is gone the moment the user says so.
+$ui.chkRememberCredentials.Add_Checked({
+    Save-Credentials
+    Write-Log "Credentials will be remembered for the next launch (encrypted for this Windows account)"
+})
+
+$ui.chkRememberCredentials.Add_Unchecked({
+    Remove-SavedCredentials
+    Write-Log "Saved credentials deleted from disk"
+})
+
 # Clear log
 $ui.btnClearLog.Add_Click({
     $ui.txtLog.Clear()
@@ -2043,14 +2179,25 @@ $window.Add_Closed({
 try { Add-Type -AssemblyName Microsoft.VisualBasic } catch {}
 
 # ── Launch ────────────────────────────────────────────────────────────────────
+# Bring back today's log first, before this session appends anything to it.
+Restore-LogWindow
+
 Write-Log "Server Patch Tool started"
-Write-Log "Please authenticate to begin managing servers"
 
 # Load saved servers
 Load-ServerList
 
-# Prompt for credentials on startup
+# Restore saved credentials. Setting the checkbox fires Add_Checked, which
+# re-saves the same data - harmless, and it keeps the box honest about state.
+if (Load-Credentials) {
+    $ui.chkRememberCredentials.IsChecked = $true
+} else {
+    Write-Log "Please authenticate to begin managing servers"
+}
+
+# Prompt for credentials on startup, but only if nothing was restored.
 $window.Add_ContentRendered({
+    if ($script:Credentials.Count -gt 0) { return }
     $result = Add-CredentialSet -Message "Enter primary credentials for server management (domain\username)`nYou can add more credentials later for other domains."
     if (-not $result) {
         Write-Log "No credentials provided. Add credentials via the 'Add Credential' button." "WARN"
