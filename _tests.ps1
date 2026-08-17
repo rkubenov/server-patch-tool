@@ -309,6 +309,88 @@ Check "nothing is invented"                    ($null -eq (Get-ServerCredential 
 
 
 # =============================================================================
+Section "Credential removal survives a restart"
+# Removing a credential updated memory and servers.json but never rewrote
+# credentials.json, so the next launch read the deleted account back in.
+# These cases run the real save/load pair over a temporary file.
+# =============================================================================
+Invoke-Expression (Get-FunctionText -Name 'Remove-CredentialSet')
+Invoke-Expression (Get-FunctionText -Name 'Save-Credentials')
+Invoke-Expression (Get-FunctionText -Name 'Load-Credentials')
+Invoke-Expression (Get-FunctionText -Name 'Remove-SavedCredentials')
+
+function Update-CredentialStatus { }
+function Save-ServerList { }
+
+$script:CredDir  = Join-Path $env:TEMP "spt-tests-$PID"
+$script:CredFile = Join-Path $script:CredDir 'credentials.json'
+$ui = @{
+    chkRememberCredentials = [PSCustomObject]@{ IsChecked = $true }
+    dgServers              = [PSCustomObject]@{ Items = (New-Object PSObject) }
+}
+$ui.dgServers.Items | Add-Member ScriptMethod Refresh { }
+
+# Synthetic accounts with a throwaway password - never a real secret.
+function New-TestCredential {
+    param([string]$UserName)
+    New-Object System.Management.Automation.PSCredential(
+        $UserName, (ConvertTo-SecureString 'placeholder-not-a-secret' -AsPlainText -Force))
+}
+
+function Reset-CredentialFixture {
+    $script:Credentials = @{
+        'DOM1\user-a' = (New-TestCredential 'DOM1\user-a')
+        'DOM2\user-b' = (New-TestCredential 'DOM2\user-b')
+    }
+    $script:DefaultCredentialLabel = 'DOM1\user-a'
+    $script:ServerData = @([PSCustomObject]@{ ServerName = 'srv-1'; CredentialLabel = 'DOM2\user-b' })
+    $script:Logged = @()
+    Save-Credentials
+}
+
+# Stands in for closing and reopening the tool: memory is dropped, disk is not.
+function Invoke-Restart {
+    $script:Credentials = @{}
+    $script:DefaultCredentialLabel = $null
+    Load-Credentials | Out-Null
+}
+
+Case "a removed credential must not come back after a restart"
+Reset-CredentialFixture
+Check "both accounts were saved to begin with" ((Get-Content -LiteralPath $script:CredFile -Raw) -match 'DOM2')
+Remove-CredentialSet -Label 'DOM2\user-b' | Out-Null
+Check "it is gone from memory straight away"   (-not $script:Credentials.ContainsKey('DOM2\user-b'))
+Invoke-Restart
+Check "it is still gone after a restart"       (-not $script:Credentials.ContainsKey('DOM2\user-b'))
+Check "the other account survived"             ($script:Credentials.ContainsKey('DOM1\user-a'))
+
+Case "removing the default one keeps a usable default after a restart"
+Reset-CredentialFixture
+Remove-CredentialSet -Label 'DOM1\user-a' | Out-Null
+Invoke-Restart
+Check "the deleted default did not come back"  (-not $script:Credentials.ContainsKey('DOM1\user-a'))
+Check "the survivor became the default"        ($script:DefaultCredentialLabel -eq 'DOM2\user-b')
+
+Case "removing the last credential leaves nothing behind"
+Reset-CredentialFixture
+Remove-CredentialSet -Label 'DOM1\user-a' | Out-Null
+Remove-CredentialSet -Label 'DOM2\user-b' | Out-Null
+Invoke-Restart
+Check "no credential is restored"              ($script:Credentials.Count -eq 0)
+Check "no misleading decryption warning"       ((Get-LoggedLike '*could not be decrypted*').Count -eq 0)
+
+Case "removing something that is not there changes nothing"
+Reset-CredentialFixture
+$before = $script:Credentials.Count
+Check "the call reports it did nothing"        ((Remove-CredentialSet -Label 'DOM9\nobody') -eq $false)
+Check "no credential was dropped"              ($script:Credentials.Count -eq $before)
+
+if (Test-Path -LiteralPath $script:CredDir) {
+    Remove-Item -LiteralPath $script:CredDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+
+# =============================================================================
 Section "Sequential queue tail"
 # The completion callbacks are closures, and a closure is bound to a module of
 # its own: an assignment to a $script: variable inside one sets a copy and never
