@@ -663,6 +663,14 @@ function Get-StatusColor {
 function Save-Credentials {
     if (-not $ui.chkRememberCredentials.IsChecked) { return }
     try {
+        # Nothing left to remember means the file has to go, not be rewritten
+        # empty: piping an empty array into ConvertTo-Json produces no output
+        # at all, so Set-Content left the previous contents untouched and the
+        # last credential removed reappeared on the next launch.
+        if ($script:Credentials.Count -eq 0) {
+            Remove-SavedCredentials
+            return
+        }
         if (-not (Test-Path -LiteralPath $script:CredDir)) {
             New-Item -ItemType Directory -Path $script:CredDir -Force | Out-Null
         }
@@ -754,6 +762,43 @@ function Add-CredentialSet {
         return $label
     }
     return $null
+}
+
+# Removes a credential set and re-points whatever referred to it. Kept out of
+# the Manage button's handler so it can be exercised without opening a dialog.
+function Remove-CredentialSet {
+    param([string]$Label)
+
+    if (-not $Label -or -not $script:Credentials.ContainsKey($Label)) { return $false }
+    $script:Credentials.Remove($Label)
+
+    # Pick the replacement default BEFORE re-pointing the servers. The other
+    # order handed them $DefaultCredentialLabel while it still held the label
+    # being deleted, so they kept a reference to a credential that no longer
+    # existed and Get-ServerCredential quietly fell back to whichever one
+    # happened to be first - possibly an account for another domain, which
+    # costs a failed logon on every one of those servers.
+    if ($script:DefaultCredentialLabel -eq $Label) {
+        $script:DefaultCredentialLabel =
+            if ($script:Credentials.Count -gt 0) { @($script:Credentials.Keys)[0] } else { $null }
+    }
+    $replacement = if ($script:DefaultCredentialLabel) { $script:DefaultCredentialLabel } else { "" }
+    foreach ($s in $script:ServerData) {
+        if ($s.CredentialLabel -eq $Label) {
+            $s.CredentialLabel = $replacement
+        }
+    }
+
+    $ui.dgServers.Items.Refresh()
+    Update-CredentialStatus
+    # Without this the removal lived only in memory: credentials.json still
+    # held the account, so the next launch loaded it straight back and the
+    # deletion looked like it had never happened. Save-Credentials writes the
+    # whole set, so rewriting it here is all that is needed.
+    Save-Credentials
+    Save-ServerList
+    Write-Log "Removed credential: $Label"
+    return $true
 }
 
 function Update-CredentialStatus {
@@ -2148,30 +2193,7 @@ $ui.btnManageCredentials.Add_Click({
     } catch {
         $toRemove = ""
     }
-    if ($toRemove -and $script:Credentials.ContainsKey($toRemove)) {
-        $script:Credentials.Remove($toRemove)
-
-        # Pick the replacement default BEFORE re-pointing the servers. The old
-        # order handed them $DefaultCredentialLabel while it still held the
-        # label being deleted, so they kept a reference to a credential that no
-        # longer existed and Get-ServerCredential quietly fell back to whichever
-        # one happened to be first - possibly an account for another domain,
-        # which costs a failed logon on every one of those servers.
-        if ($script:DefaultCredentialLabel -eq $toRemove) {
-            $script:DefaultCredentialLabel =
-                if ($script:Credentials.Count -gt 0) { @($script:Credentials.Keys)[0] } else { $null }
-        }
-        $replacement = if ($script:DefaultCredentialLabel) { $script:DefaultCredentialLabel } else { "" }
-        foreach ($s in $script:ServerData) {
-            if ($s.CredentialLabel -eq $toRemove) {
-                $s.CredentialLabel = $replacement
-            }
-        }
-        $ui.dgServers.Items.Refresh()
-        Update-CredentialStatus
-        Save-ServerList
-        Write-Log "Removed credential: $toRemove"
-    }
+    Remove-CredentialSet -Label $toRemove | Out-Null
 })
 
 # Context menu handlers
