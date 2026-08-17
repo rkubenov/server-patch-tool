@@ -38,8 +38,8 @@ if (-not (Test-Path -LiteralPath $script:LogDir)) {
 [xml]$xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Server Patch Tool" Height="720" Width="1100"
-        MinHeight="600" MinWidth="900"
+        Title="Server Patch Tool" Height="720" Width="1240"
+        MinHeight="600" MinWidth="1000"
         WindowStartupLocation="CenterScreen"
         Background="#1e1e2e" Foreground="#cdd6f4">
 
@@ -338,6 +338,19 @@ if (-not (Test-Path -LiteralPath $script:LogDir)) {
                         <ComboBoxItem Content="15"/>
                         <ComboBoxItem Content="20"/>
                         <ComboBoxItem Content="30"/>
+                    </ComboBox>
+                    <TextBlock Text="Limit:" Foreground="#a6adc8" VerticalAlignment="Center"
+                               Margin="10,0,4,0" FontSize="12"
+                               ToolTip="Time limit for a single install"/>
+                    <ComboBox x:Name="cboInstallTimeout" Width="72" VerticalAlignment="Center"
+                              SelectedIndex="2"
+                              ToolTip="How long to wait for an install before giving up on watching it. A cumulative update often needs more than an hour. Running out of time does not cancel anything: the install carries on and the server is marked 'Still installing'.">
+                        <ComboBoxItem Content="30 min"/>
+                        <ComboBoxItem Content="60 min"/>
+                        <ComboBoxItem Content="90 min"/>
+                        <ComboBoxItem Content="120 min"/>
+                        <ComboBoxItem Content="180 min"/>
+                        <ComboBoxItem Content="240 min"/>
                     </ComboBox>
                     <Border Width="1" Background="#45475a" Margin="8,2"/>
                     <Button x:Name="btnScanSelected" Content="Scan Selected" Style="{StaticResource AccentButton}"
@@ -771,9 +784,15 @@ function Get-ServerCredential {
     if ($label -and $script:Credentials.ContainsKey($label)) {
         return $script:Credentials[$label]
     }
-    # Fallback: return any available credential
+    # Fallback: the entry may still point at a credential that has been removed.
+    # Using a different one is a guess - and a wrong guess costs a failed logon
+    # against the server - so it is recorded rather than done silently.
     if ($script:Credentials.Count -gt 0) {
-        return @($script:Credentials.Values)[0]
+        $fallback = @($script:Credentials.Keys)[0]
+        if ($label) {
+            Write-Log "$ServerName : credential '$label' no longer exists, falling back to '$fallback'" "WARN"
+        }
+        return $script:Credentials[$fallback]
     }
     return $null
 }
@@ -945,27 +964,44 @@ try {
             $installResult     = $installer.Install()
             Log "Install finished. ResultCode=$($installResult.ResultCode) RebootRequired=$($installResult.RebootRequired)"
 
+            # Per-update outcomes are kept, not just counted: the caller shows
+            # which KBs failed, and "how many succeeded" alone cannot tell an
+            # operator whether a server still needs attention.
             $ok = 0; $fail = 0
+            $okList = @(); $failList = @()
             for ($i = 0; $i -lt $toInstall.Count; $i++) {
                 $rc = $installResult.GetUpdateResult($i).ResultCode
                 $title = $toInstall.Item($i).Title
                 if ($rc -eq 2) {
                     $ok++
+                    $okList += $title
                     Log "  OK: $title"
                 } else {
                     $fail++
+                    $failList += "$title (result code $rc)"
                     Log "  FAILED (code $rc): $title"
                 }
             }
 
             $sysInfo = New-Object -ComObject Microsoft.Update.SystemInfo
+            if ($fail -gt 0) {
+                $msg = "Installed $ok of $($toInstall.Count) update(s), $fail failed"
+                $err = "$fail update(s) failed to install"
+            } else {
+                $msg = "Installed $ok update(s)"
+                $err = $null
+            }
+            # Success means "the installer ran and reported per-update results",
+            # not "everything installed" - $FailedCount carries that.
             $result = @{
-                Success        = $true
-                InstalledCount = $ok
-                FailedCount    = $fail
-                RebootRequired = $sysInfo.RebootRequired
-                Error          = $null
-                Message        = "Installed $ok update(s)"
+                Success         = $true
+                InstalledCount  = $ok
+                FailedCount     = $fail
+                InstalledTitles = $okList
+                FailedTitles    = $failList
+                RebootRequired  = $sysInfo.RebootRequired
+                Error           = $err
+                Message         = $msg
             }
         }
     }
@@ -1032,6 +1068,14 @@ $script:RunAsSystemScript = {
                 try { $acl.SetOwner($sidAdmins) } catch { }
                 Set-Acl -Path $workDir -AclObject $acl
 
+                # A run that times out deliberately leaves its script, log and
+                # result file behind for diagnosis, so something has to collect
+                # them eventually. A week is long enough to investigate and
+                # short enough that the directory cannot grow without bound.
+                Get-ChildItem -LiteralPath $workDir -File -ErrorAction SilentlyContinue |
+                    Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-7) } |
+                    Remove-Item -Force -ErrorAction SilentlyContinue
+
                 # -- Per-run file names ---------------------------------------
                 $runId      = [guid]::NewGuid().ToString('N')
                 $taskName   = "SPT_${Op}_$runId"
@@ -1045,6 +1089,7 @@ $script:RunAsSystemScript = {
                            "`$LogPath = '$logPath'" + [Environment]::NewLine
                 Set-Content -Path $scriptPath -Value ($prelude + $Code) -Encoding UTF8 -Force
 
+                $timedOut = $false
                 try {
                     $action = New-ScheduledTaskAction -Execute "powershell.exe" `
                                 -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`""
@@ -1077,10 +1122,21 @@ $script:RunAsSystemScript = {
                         return (Get-Content -Path $resultPath -Raw -Encoding UTF8)
                     }
                     if ($elapsed -ge $Timeout) {
+                        # Running out of time is not a failure of the payload -
+                        # it is this tool giving up on watching. The task is
+                        # left registered and its log left on disk: deleting the
+                        # task definition would not stop an install that is
+                        # under way, it would only throw away the only record of
+                        # what happened. A later scan reports the real outcome.
+                        $timedOut = $true
+                        $where = "Task '$taskName' was left running on $env:COMPUTERNAME; log: $logPath"
                         return (@{
-                            Success = $false
-                            Error   = "$Op timed out after $([int]($Timeout / 60)) minutes. Log: $diag"
-                            Message = "Timed out"
+                            Success  = $false
+                            TimedOut = $true
+                            TaskName = $taskName
+                            LogPath  = $logPath
+                            Error    = "$Op still going after $([int]($Timeout / 60)) minutes. $where. Log so far: $diag"
+                            Message  = "Still running"
                         } | ConvertTo-Json -Depth 3)
                     }
                     $err = "Result file not created. "
@@ -1088,8 +1144,11 @@ $script:RunAsSystemScript = {
                     else       { $err += "No diagnostic log found - the task may have failed to start." }
                     return (@{ Success = $false; Error = $err; Message = "Task failed" } | ConvertTo-Json -Depth 3)
                 } finally {
-                    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-                    Remove-Item -Path $scriptPath, $resultPath, $logPath -Force -ErrorAction SilentlyContinue
+                    # Kept on purpose after a timeout - see the branch above.
+                    if (-not $timedOut) {
+                        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+                        Remove-Item -Path $scriptPath, $resultPath, $logPath -Force -ErrorAction SilentlyContinue
+                    }
                 }
             }
         } finally {
@@ -1111,8 +1170,22 @@ $script:RunAsSystemScript = {
 }
 
 # Timeouts for the SYSTEM payloads, in seconds.
-$script:ScanTimeout    = 600    # 10 min
-$script:InstallTimeout = 1800   # 30 min
+$script:ScanTimeout = 600    # 10 min
+
+# The install limit used to be 30 minutes and hardcoded, which is less than a
+# Windows Server cumulative update routinely takes: the tool declared an error
+# while the install was still perfectly healthy. It is now chosen in the
+# toolbar, defaults to 90 minutes, and running out of it no longer destroys the
+# evidence - see the timeout branch of $RunAsSystemScript.
+$script:InstallTimeoutDefault = 5400   # 90 min
+
+function Get-InstallTimeout {
+    $item = $ui.cboInstallTimeout.SelectedItem
+    if (-not $item) { return $script:InstallTimeoutDefault }
+    $minutes = [int]($item.Content -replace '\D')
+    if ($minutes -lt 1) { return $script:InstallTimeoutDefault }
+    return ($minutes * 60)
+}
 
 # Reboot: triggers the restart and records the boot time beforehand, so the
 # monitor can later prove the machine really came back rather than guessing.
@@ -1242,24 +1315,25 @@ function Start-AsyncJob {
 $script:JobTimer = [System.Windows.Threading.DispatcherTimer]::new()
 $script:JobTimer.Interval = [TimeSpan]::FromMilliseconds(500)
 $script:JobTimer.Add_Tick({
-    $completed = @()
-    foreach ($job in $script:ActiveJobs) {
-        if ($job.Handle.IsCompleted) {
-            try {
-                $result = $job.PowerShell.EndInvoke($job.Handle)
-                if ($job.OnComplete) {
-                    & $job.OnComplete $result
-                }
-            } catch {
-                Write-Log "Job error: $($_.Exception.Message)" "ERROR"
-            } finally {
-                $job.PowerShell.Dispose()
+    # Walk a snapshot, and drop each finished job before its callback runs.
+    # Callbacks start new jobs - the next server of a sequential install, the
+    # post-reboot monitor, the confirming rescan - which adds to $ActiveJobs.
+    # Enumerating the live list threw "Collection was modified" out of the tick
+    # as soon as that happened, leaving the finished job in the list to be
+    # EndInvoke'd again on the next tick and logged as a phantom "Job error".
+    foreach ($job in @($script:ActiveJobs)) {
+        if (-not $job.Handle.IsCompleted) { continue }
+        $script:ActiveJobs.Remove($job) | Out-Null
+        try {
+            $result = $job.PowerShell.EndInvoke($job.Handle)
+            if ($job.OnComplete) {
+                & $job.OnComplete $result
             }
-            $completed += $job
+        } catch {
+            Write-Log "Job error: $($_.Exception.Message)" "ERROR"
+        } finally {
+            $job.PowerShell.Dispose()
         }
-    }
-    foreach ($c in $completed) {
-        $script:ActiveJobs.Remove($c) | Out-Null
     }
 
     # Update progress
@@ -1303,19 +1377,56 @@ function Complete-InstallResult {
     param([string]$ServerName, $Result)
 
     if ($Result.Success) {
-        $reboot  = if ($Result.RebootRequired) { "Yes" } else { "No" }
-        $status  = if ($Result.RebootRequired) { "Reboot Required" } else { "Up to date" }
-        $details = $Result.Message
-        if ($Result.FailedCount -gt 0) { $details += " ($($Result.FailedCount) failed)" }
+        $failed = [int]$Result.FailedCount
+        $reboot = if ($Result.RebootRequired) { "Yes" } else { "No" }
+
+        # A partly failed install used to be reported as "Up to date" with
+        # Available = 0 and the failure count buried in the Details text: the
+        # operator saw a clean green row on a server where half the KBs had not
+        # installed. Updates that failed are still outstanding, so they are
+        # counted as available and the row gets a status of its own.
+        if ($failed -gt 0) {
+            $status  = "Completed with errors"
+            $details = $Result.Message
+            if ($Result.FailedTitles) { $details += ". Failed: $(@($Result.FailedTitles) -join '; ')" }
+        } elseif ($Result.RebootRequired) {
+            $status  = "Reboot Required"
+            $details = $Result.Message
+        } else {
+            $status  = "Up to date"
+            $details = $Result.Message
+        }
 
         Update-ServerEntry -ServerName $ServerName -Properties @{
             Status         = $status
             Installed      = $Result.InstalledCount.ToString()
-            Available      = "0"
+            Available      = $failed.ToString()
             RebootRequired = $reboot
             Details        = $details
         }
-        Write-Log "$ServerName : $($Result.Message)$(if($Result.RebootRequired){' - reboot required'})"
+        $level = if ($failed -gt 0) { "WARN" } else { "INFO" }
+        Write-Log "$ServerName : $($Result.Message)$(if($Result.RebootRequired){' - reboot required'})" $level
+        if ($failed -gt 0) {
+            foreach ($t in @($Result.FailedTitles)) { Write-Log "$ServerName :   failed - $t" "WARN" }
+        }
+
+        # Everything above is the installer's own account of what it did. It is
+        # confirmed against the server, because that is the only thing that can
+        # distinguish "installed" from "reported as installed". A server waiting
+        # on a reboot is skipped here - the post-reboot monitor rescans anyway,
+        # and a scan before the reboot would only repeat what is already known.
+        if (-not $Result.RebootRequired) {
+            Write-Log "$ServerName : verifying with a rescan"
+            Invoke-ScanServer -ServerName $ServerName -NoProgress
+        }
+    } elseif ($Result.TimedOut) {
+        # The install did not fail - the tool stopped watching it. Saying
+        # "Error" here would be a lie and would hide a run that is still going.
+        Update-ServerEntry -ServerName $ServerName -Properties @{
+            Status  = "Still installing"
+            Details = "Stopped watching after the time limit. The install is still running on the server - rescan later for the result. $($Result.Error)"
+        }
+        Write-Log "$ServerName : $($Result.Error)" "WARN"
     } else {
         Update-ServerEntry -ServerName $ServerName -Properties @{
             Status  = "Error"
@@ -1480,7 +1591,7 @@ function Invoke-InstallServer {
     Write-Log "Installing updates on $ServerName..."
 
     $cred = Get-ServerCredential -ServerName $ServerName
-    Start-AsyncJob -ScriptBlock $script:RunAsSystemScript -Arguments @($ServerName, $cred, $script:InstallPayload, $script:InstallTimeout, 'Install') -OnComplete {
+    Start-AsyncJob -ScriptBlock $script:RunAsSystemScript -Arguments @($ServerName, $cred, $script:InstallPayload, (Get-InstallTimeout), 'Install') -OnComplete {
         param($result)
         Complete-InstallResult -ServerName $ServerName -Result ($result | Select-Object -First 1)
     }.GetNewClosure()
@@ -1711,6 +1822,30 @@ $ui.btnScanAll.Add_Click({
 })
 
 # ── Sequential Install Logic ──────────────────────────────────────────────────
+# Advances the install queue: next server, or wind the run down.
+#
+# This has to be a function rather than a few lines in the completion callback.
+# Those callbacks are created with .GetNewClosure(), and a closure is bound to a
+# module of its own: reading $script: still works and method calls like
+# Dequeue() still mutate the real object, but a plain assignment such as
+# "$script:SequentialRunning = $false" lands in the closure's own scope and
+# never reaches the variable Start-InstallBatch reads. The flag stayed $true for
+# the rest of the session, so every later batch was refused with "a sequential
+# run is still in progress" until the tool was restarted. A function keeps the
+# session state it was defined in, so its writes land where they are read.
+function Step-SequentialInstallQueue {
+    if ($script:SequentialQueue.Count -gt 0) {
+        $next = $script:SequentialQueue.Dequeue()
+        Update-StatusBar "Installing on $next... ($($script:SequentialQueue.Count) remaining in queue)"
+        Invoke-InstallServerSequential -ServerName $next
+    } else {
+        $script:SequentialRunning = $false
+        Update-StatusBar "Sequential install complete"
+        Show-Progress -Visible $false
+        Write-Log "Sequential install queue completed"
+    }
+}
+
 function Invoke-InstallServerSequential {
     param([string]$ServerName)
 
@@ -1726,22 +1861,10 @@ function Invoke-InstallServerSequential {
     Write-Log "Installing updates on $ServerName (sequential mode)..."
 
     $cred = Get-ServerCredential -ServerName $ServerName
-    Start-AsyncJob -ScriptBlock $script:RunAsSystemScript -Arguments @($ServerName, $cred, $script:InstallPayload, $script:InstallTimeout, 'Install') -OnComplete {
+    Start-AsyncJob -ScriptBlock $script:RunAsSystemScript -Arguments @($ServerName, $cred, $script:InstallPayload, (Get-InstallTimeout), 'Install') -OnComplete {
         param($result)
         Complete-InstallResult -ServerName $ServerName -Result ($result | Select-Object -First 1)
-
-        # Process next in queue
-        if ($script:SequentialQueue.Count -gt 0) {
-            $next = $script:SequentialQueue.Dequeue()
-            $remaining = $script:SequentialQueue.Count
-            Update-StatusBar "Installing on $next... ($remaining remaining in queue)"
-            Invoke-InstallServerSequential -ServerName $next
-        } else {
-            $script:SequentialRunning = $false
-            Update-StatusBar "Sequential install complete"
-            Show-Progress -Visible $false
-            Write-Log "Sequential install queue completed"
-        }
+        Step-SequentialInstallQueue
     }.GetNewClosure()
 }
 
@@ -1819,6 +1942,28 @@ $ui.btnInstallAll.Add_Click({
 $script:RebootQueue = [System.Collections.Generic.Queue[string]]::new()
 $script:RebootQueueRunning = $false
 
+# Advances the reboot queue. A function for the same reason as
+# Step-SequentialInstallQueue: the callers are closures, and a flag cleared
+# inside one of those never reaches the flag the batch buttons read.
+# -AfterFailure only changes the wording - a failed reboot must not strand the
+# servers queued behind it.
+function Step-RebootQueue {
+    param([switch]$AfterFailure)
+
+    if ($script:RebootQueue.Count -gt 0) {
+        $next = $script:RebootQueue.Dequeue()
+        $note = if ($AfterFailure) { " (previous failed)" } else { "" }
+        Update-StatusBar "Rebooting $next... ($($script:RebootQueue.Count) remaining in queue)"
+        Write-Log "Sequential reboot: proceeding to $next$note"
+        Invoke-RebootServerSequential -ServerName $next
+    } else {
+        $script:RebootQueueRunning = $false
+        Update-StatusBar "Sequential reboot complete"
+        Show-Progress -Visible $false
+        Write-Log "Sequential reboot queue completed"
+    }
+}
+
 function Invoke-RebootServerSequential {
     param([string]$ServerName)
 
@@ -1845,20 +1990,7 @@ function Invoke-RebootServerSequential {
             Start-AsyncJob -ScriptBlock $script:RebootMonitorScript -Arguments @($ServerName, $monCred, $r.BootBefore) -OnComplete {
                 param($monResult)
                 Complete-RebootMonitor -ServerName $ServerName -Monitor ($monResult | Select-Object -First 1)
-
-                # Process next in reboot queue
-                if ($script:RebootQueue.Count -gt 0) {
-                    $next = $script:RebootQueue.Dequeue()
-                    $remaining = $script:RebootQueue.Count
-                    Update-StatusBar "Rebooting $next... ($remaining remaining in queue)"
-                    Write-Log "Sequential reboot: proceeding to $next"
-                    Invoke-RebootServerSequential -ServerName $next
-                } else {
-                    $script:RebootQueueRunning = $false
-                    Update-StatusBar "Sequential reboot complete"
-                    Show-Progress -Visible $false
-                    Write-Log "Sequential reboot queue completed"
-                }
+                Step-RebootQueue
             }.GetNewClosure()
         } else {
             Update-ServerEntry -ServerName $ServerName -Properties @{
@@ -1867,18 +1999,8 @@ function Invoke-RebootServerSequential {
             }
             Write-Log "$ServerName : Reboot failed - $($r.Error)" "ERROR"
 
-            # Even on failure, proceed to next in queue
-            if ($script:RebootQueue.Count -gt 0) {
-                $next = $script:RebootQueue.Dequeue()
-                $remaining = $script:RebootQueue.Count
-                Update-StatusBar "Rebooting $next... ($remaining remaining in queue)"
-                Write-Log "Sequential reboot: proceeding to $next (previous failed)"
-                Invoke-RebootServerSequential -ServerName $next
-            } else {
-                $script:RebootQueueRunning = $false
-                Update-StatusBar "Sequential reboot complete"
-                Show-Progress -Visible $false
-            }
+            # A failed reboot must not strand the servers queued behind it.
+            Step-RebootQueue -AfterFailure
         }
     }.GetNewClosure()
 }
@@ -2028,14 +2150,22 @@ $ui.btnManageCredentials.Add_Click({
     }
     if ($toRemove -and $script:Credentials.ContainsKey($toRemove)) {
         $script:Credentials.Remove($toRemove)
-        # Clear assignment from servers using this credential
+
+        # Pick the replacement default BEFORE re-pointing the servers. The old
+        # order handed them $DefaultCredentialLabel while it still held the
+        # label being deleted, so they kept a reference to a credential that no
+        # longer existed and Get-ServerCredential quietly fell back to whichever
+        # one happened to be first - possibly an account for another domain,
+        # which costs a failed logon on every one of those servers.
+        if ($script:DefaultCredentialLabel -eq $toRemove) {
+            $script:DefaultCredentialLabel =
+                if ($script:Credentials.Count -gt 0) { @($script:Credentials.Keys)[0] } else { $null }
+        }
+        $replacement = if ($script:DefaultCredentialLabel) { $script:DefaultCredentialLabel } else { "" }
         foreach ($s in $script:ServerData) {
             if ($s.CredentialLabel -eq $toRemove) {
-                $s.CredentialLabel = $script:DefaultCredentialLabel
+                $s.CredentialLabel = $replacement
             }
-        }
-        if ($script:DefaultCredentialLabel -eq $toRemove) {
-            $script:DefaultCredentialLabel = if ($script:Credentials.Count -gt 0) { @($script:Credentials.Keys)[0] } else { $null }
         }
         $ui.dgServers.Items.Refresh()
         Update-CredentialStatus
