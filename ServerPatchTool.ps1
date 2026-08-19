@@ -1289,46 +1289,83 @@ $script:RebootMonitorScript = {
         } catch { return $null }
     }
 
+    # A description that is never empty. Exception.Message on its own can be,
+    # and that produced a log line reading only "Monitor error -", which said
+    # that something had failed but nothing about what.
+    $describe = {
+        param($Record)
+        $ex   = $Record.Exception
+        $text = if ($ex -and $ex.Message) { $ex.Message } else { [string]$Record }
+        if (-not $text) { $text = "no details available" }
+        if ($ex) { "$($ex.GetType().Name): $text" } else { $text }
+    }
+
+    $attempts  = 0
+    $sawDown   = $false
+    $lastIssue = $null
+
     try {
         # Cumulative updates applied during shutdown/startup can take a while.
         $deadline = (Get-Date).AddMinutes(30)
-        $sawDown  = $false
 
         while ((Get-Date) -lt $deadline) {
             Start-Sleep -Seconds 10
-            $boot = & $probe $ServerName $Credential
+            $attempts++
 
-            if ($null -eq $boot) {
-                # Unreachable: shutting down, or still booting.
-                $sawDown = $true
-                continue
-            }
-            if ($BootBefore) {
-                if ([datetime]$boot -ne [datetime]$BootBefore) {
-                    return [PSCustomObject]@{ Phase = "Online"; Error = $null }
+            # One bad probe must not end the watch. The machine is rebooting,
+            # so transient oddities are expected - a half-open WinRM listener,
+            # a boot time that cannot be read yet - and letting one of them
+            # escape stopped the tool from looking while the server was still
+            # on its way back.
+            try {
+                $boot = & $probe $ServerName $Credential
+
+                if ($null -eq $boot) {
+                    # Unreachable: shutting down, or still booting.
+                    $sawDown = $true
+                    continue
                 }
-                # Reachable with the same boot time: shutdown has not begun yet.
-            } elseif ($sawDown) {
-                # No baseline was captured - fall back to down-then-up.
-                return [PSCustomObject]@{ Phase = "Online"; Error = $null }
+                if ($BootBefore) {
+                    if ([datetime]$boot -ne [datetime]$BootBefore) {
+                        return [PSCustomObject]@{
+                            Phase = "Online"; Error = $null; Attempts = $attempts
+                        }
+                    }
+                    # Reachable with the same boot time: shutdown has not begun.
+                } elseif ($sawDown) {
+                    # No baseline was captured - fall back to down-then-up.
+                    return [PSCustomObject]@{
+                        Phase = "Online"; Error = $null; Attempts = $attempts
+                    }
+                }
+            } catch {
+                $lastIssue = & $describe $_
+                $sawDown   = $true
             }
         }
 
         # Timed out. The ping here is diagnostic only, never a gate: it just
         # distinguishes "box is up, WinRM is not" from "box is gone".
+        $trail = if ($lastIssue) { " Last problem seen: $lastIssue" } else { "" }
         $pingable = Test-Connection -ComputerName $ServerName -Count 2 -Quiet -ErrorAction SilentlyContinue
         if ($pingable) {
             return [PSCustomObject]@{
-                Phase = "WinRMTimeout"
-                Error = "Server answers ping but no completed reboot was confirmed within 30 minutes"
+                Phase    = "WinRMTimeout"
+                Error    = "Server answers ping but no completed reboot was confirmed within 30 minutes.$trail"
+                Attempts = $attempts
             }
         }
         return [PSCustomObject]@{
-            Phase = "Timeout"
-            Error = "Server did not come back within 30 minutes"
+            Phase    = "Timeout"
+            Error    = "Server did not come back within 30 minutes.$trail"
+            Attempts = $attempts
         }
     } catch {
-        return [PSCustomObject]@{ Phase = "Error"; Error = $_.Exception.Message }
+        return [PSCustomObject]@{
+            Phase    = "Error"
+            Error    = (& $describe $_)
+            Attempts = $attempts
+        }
     }
 }
 
@@ -1488,7 +1525,15 @@ function Complete-InstallResult {
 function Complete-RebootMonitor {
     param([string]$ServerName, $Monitor)
 
-    switch ($Monitor.Phase) {
+    # Neither losing the monitor nor an error inside it proves anything about
+    # the server, so both now fall back to the one check that does - a scan.
+    # A job that produced no output at all used to land in the default branch
+    # and be logged as "Monitor error -" with nothing after it: the tool called
+    # the server broken and stopped watching, without saying why, while the
+    # machine was very likely on its way back up.
+    $phase = if ($null -eq $Monitor) { $null } else { $Monitor.Phase }
+
+    switch ($phase) {
         "Online" {
             Update-ServerEntry -ServerName $ServerName -Properties @{
                 Status         = "Back Online"
@@ -1515,11 +1560,18 @@ function Complete-RebootMonitor {
             Write-Log "$ServerName : Pingable but WinRM not ready" "WARN"
         }
         default {
+            $reason =
+                if     ($null -eq $Monitor) { "the monitor job returned no result" }
+                elseif ($Monitor.Error)     { $Monitor.Error }
+                elseif ($phase)             { "the monitor reported '$phase' without a reason" }
+                else                        { "the monitor result carried no phase" }
+
             Update-ServerEntry -ServerName $ServerName -Properties @{
-                Status  = "Error"
-                Details = "Post-reboot monitor error: $($Monitor.Error)"
+                Status  = "Reboot issued"
+                Details = "Lost track of the reboot: $reason. Re-scanning to find out whether the server is back."
             }
-            Write-Log "$ServerName : Monitor error - $($Monitor.Error)" "ERROR"
+            Write-Log "$ServerName : lost track of the reboot - $reason; re-scanning instead" "WARN"
+            Invoke-ScanServer -ServerName $ServerName -NoProgress
         }
     }
     Step-Progress
