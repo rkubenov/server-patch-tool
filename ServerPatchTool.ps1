@@ -1685,6 +1685,62 @@ function Complete-RebootMonitor {
     Step-Progress
 }
 
+# Starts the watch that proves a server really came back, and hands the queue on
+# afterwards when a sequential run is waiting for it.
+#
+# This has to be a function. A completion callback is a closure, and a closure
+# is bound to a module of its own: it sees only the local variables copied into
+# it when it was created. Two consequences bit here. A $script: variable read
+# from inside one comes out empty - so launching the monitor from within the
+# reboot callback passed a null script block to the job, which then finished
+# instantly with no output at all. And a closure created inside another closure
+# captures nothing, so the callback had no server name in it: the fallback
+# rescan went out with an empty -ComputerName and failed on the spot. Both are
+# visible in the log as a monitor that "returned no result" one second after
+# the reboot, followed by lines with no server name in them.
+# Applies the result of an Active Directory query to the grid. A function for
+# the same reason as Start-RebootMonitor: this ran inside a completion closure,
+# where $script:ServerData and $window are both empty. The duplicate check
+# therefore passed for every name, and the add that followed was made on
+# nothing at all.
+#
+# No dispatcher hop here: completion callbacks are delivered by a
+# DispatcherTimer, so this is already on the UI thread.
+function Complete-ADImport {
+    param($Result)
+
+    if (-not $Result.Success) {
+        Write-Log "AD query failed: $($Result.Error)" "ERROR"
+        Update-StatusBar "AD query failed"
+        return
+    }
+
+    $added = 0
+    foreach ($name in $Result.Servers) {
+        if (-not ($script:ServerData | Where-Object { $_.ServerName -eq $name.ToUpper() })) {
+            $script:ServerData.Add((New-ServerEntry -Name $name))
+            $added++
+        }
+    }
+    Update-ServerCount
+    Save-ServerList
+    Write-Log "AD query complete: found $($Result.Servers.Count) servers, added $added new"
+    Update-StatusBar "Added $added servers from Active Directory"
+}
+
+function Start-RebootMonitor {
+    param([string]$ServerName, $BootBefore, [switch]$Sequential)
+
+    $monCred = Get-ServerCredential -ServerName $ServerName
+    Start-AsyncJob -ScriptBlock $script:RebootMonitorScript `
+                   -Arguments @($ServerName, $monCred, $BootBefore, (Get-RebootTimeout)) `
+                   -OnComplete {
+        param($monResult)
+        Complete-RebootMonitor -ServerName $ServerName -Monitor ($monResult | Select-Object -First 1)
+        if ($Sequential) { Step-RebootQueue }
+    }.GetNewClosure()
+}
+
 # Stops this tool from starting or watching anything further.
 #
 # It cannot recall work already handed to a server: an install that has begun
@@ -1834,12 +1890,7 @@ function Invoke-RebootServer {
             }
             Write-Log "$ServerName : Reboot initiated - monitoring until back online"
 
-            # Launch the post-reboot monitor
-            $monCred = Get-ServerCredential -ServerName $ServerName
-            Start-AsyncJob -ScriptBlock $script:RebootMonitorScript -Arguments @($ServerName, $monCred, $r.BootBefore, (Get-RebootTimeout)) -OnComplete {
-                param($monResult)
-                Complete-RebootMonitor -ServerName $ServerName -Monitor ($monResult | Select-Object -First 1)
-            }.GetNewClosure()
+            Start-RebootMonitor -ServerName $ServerName -BootBefore $r.BootBefore
         } else {
             Update-ServerEntry -ServerName $ServerName -Properties @{
                 Status  = "Error"
@@ -1917,26 +1968,8 @@ $ui.btnBrowseAD.Add_Click({
         }
     } -Arguments @($ou, $(if($script:DefaultCredentialLabel){$script:Credentials[$script:DefaultCredentialLabel]}else{$null})) -OnComplete {
         param($result)
-        $r = $result | Select-Object -First 1
-        if ($r.Success) {
-            $added = 0
-            foreach ($name in $r.Servers) {
-                if (-not ($script:ServerData | Where-Object { $_.ServerName -eq $name.ToUpper() })) {
-                    $window.Dispatcher.Invoke([action]{
-                        $script:ServerData.Add((New-ServerEntry -Name $name))
-                    })
-                    $added++
-                }
-            }
-            Update-ServerCount
-            Save-ServerList
-            Write-Log "AD query complete: found $($r.Servers.Count) servers, added $added new"
-            Update-StatusBar "Added $added servers from Active Directory"
-        } else {
-            Write-Log "AD query failed: $($r.Error)" "ERROR"
-            Update-StatusBar "AD query failed"
-        }
-    }.GetNewClosure()
+        Complete-ADImport -Result ($result | Select-Object -First 1)
+    }
 })
 
 # Import from file
@@ -2192,12 +2225,7 @@ function Invoke-RebootServerSequential {
             }
             Write-Log "$ServerName : Reboot initiated - monitoring until back online"
 
-            $monCred = Get-ServerCredential -ServerName $ServerName
-            Start-AsyncJob -ScriptBlock $script:RebootMonitorScript -Arguments @($ServerName, $monCred, $r.BootBefore, (Get-RebootTimeout)) -OnComplete {
-                param($monResult)
-                Complete-RebootMonitor -ServerName $ServerName -Monitor ($monResult | Select-Object -First 1)
-                Step-RebootQueue
-            }.GetNewClosure()
+            Start-RebootMonitor -ServerName $ServerName -BootBefore $r.BootBefore -Sequential
         } else {
             Update-ServerEntry -ServerName $ServerName -Properties @{
                 Status  = "Error"
@@ -2235,11 +2263,7 @@ function Start-RebootParallel {
                 }
                 Write-Log "$sn : Reboot initiated - monitoring until back online"
 
-                $monCred = Get-ServerCredential -ServerName $sn
-                Start-AsyncJob -ScriptBlock $script:RebootMonitorScript -Arguments @($sn, $monCred, $r.BootBefore, (Get-RebootTimeout)) -OnComplete {
-                    param($monResult)
-                    Complete-RebootMonitor -ServerName $sn -Monitor ($monResult | Select-Object -First 1)
-                }.GetNewClosure()
+                Start-RebootMonitor -ServerName $sn -BootBefore $r.BootBefore
             } else {
                 Update-ServerEntry -ServerName $sn -Properties @{
                     Status  = "Error"
