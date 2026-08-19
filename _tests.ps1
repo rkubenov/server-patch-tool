@@ -23,11 +23,15 @@
                                  restart, including the last one.
       5. Post-reboot monitor   - losing the monitor must not be reported as a
                                  broken server, and never without a reason.
-      6. Sequential queues     - the "run in progress" flags must be cleared
+      6. Monitor launch        - the watch must be handed a real script block
+                                 and a server name, neither of which survives
+                                 being started from inside a closure.
+      7. AD import             - found servers must reach the grid, once each.
+      8. Sequential queues     - the "run in progress" flags must be cleared
                                  when the queue drains, closures included.
-      7. Deferred re-checks    - a server the tool stopped watching must be
+      9. Deferred re-checks    - a server the tool stopped watching must be
                                  asked again, and eventually given up on.
-      8. Time limits           - the install and reboot settings are read,
+     10. Time limits           - the install and reboot settings are read,
                                  with sane fallbacks.
 
     Not covered: anything that talks to a live server, and the UI event
@@ -405,6 +409,97 @@ Check "no credential was dropped"              ($script:Credentials.Count -eq $b
 if (Test-Path -LiteralPath $script:CredDir) {
     Remove-Item -LiteralPath $script:CredDir -Recurse -Force -ErrorAction SilentlyContinue
 }
+
+
+# =============================================================================
+Section "Reboot monitor launch"
+# The monitor used to be started from inside the reboot callback, which is a
+# closure. A closure sees neither $script: variables nor anything captured by an
+# enclosing closure, so the job was handed a null script block - finishing at
+# once with no output - and its own callback had no server name in it.
+# =============================================================================
+Invoke-Expression (Get-AssignmentText -VariablePath '$script:RebootMonitorScript')
+Invoke-Expression (Get-AssignmentText -VariablePath '$script:RebootTimeoutDefault')
+Invoke-Expression (Get-FunctionText   -Name 'Get-RebootTimeout')
+Invoke-Expression (Get-FunctionText   -Name 'Start-RebootMonitor')
+
+$script:Launched = $null
+$script:Watched  = @()
+$script:Advanced = 0
+function Start-AsyncJob {
+    param([ScriptBlock]$ScriptBlock, [object[]]$Arguments, [ScriptBlock]$OnComplete)
+    $script:Launched = [PSCustomObject]@{
+        ScriptBlock = $ScriptBlock; Arguments = $Arguments; OnComplete = $OnComplete
+    }
+}
+function Get-ServerCredential   { param([string]$ServerName) "cred-for-$ServerName" }
+function Complete-RebootMonitor { param([string]$ServerName, $Monitor) $script:Watched += $ServerName }
+function Step-RebootQueue       { param([switch]$AfterFailure) $script:Advanced++ }
+
+$baseline = Get-Date
+
+Case "the job is given everything it needs"
+$script:Launched = $null; $script:Watched = @(); $script:Advanced = 0
+Start-RebootMonitor -ServerName 'srv-x' -BootBefore $baseline
+Check "a job was started"                      ($null -ne $script:Launched)
+Check "it got a real script block"             ($script:Launched.ScriptBlock -is [ScriptBlock])
+Check "the script block is not empty"          ($script:Launched.ScriptBlock.ToString().Trim().Length -gt 0)
+Check "the server name reaches the job"        ($script:Launched.Arguments[0] -eq 'srv-x')
+Check "its own credential reaches the job"     ($script:Launched.Arguments[1] -eq 'cred-for-srv-x')
+Check "the boot-time baseline reaches the job" ($script:Launched.Arguments[2] -eq $baseline)
+Check "the watch limit reaches the job"        ($script:Launched.Arguments[3] -eq $script:RebootTimeoutDefault)
+
+Case "the callback still knows which server it is watching"
+& $script:Launched.OnComplete ([PSCustomObject]@{ Phase = 'Online' })
+Check "the server name survived into the callback" ($script:Watched -contains 'srv-x')
+Check "nothing was reported for a nameless server" (-not ($script:Watched -contains ''))
+
+Case "a single reboot does not touch the queue"
+Check "the queue was not advanced"             ($script:Advanced -eq 0)
+
+Case "a sequential reboot hands the queue on"
+$script:Launched = $null; $script:Watched = @(); $script:Advanced = 0
+Start-RebootMonitor -ServerName 'srv-y' -BootBefore $baseline -Sequential
+& $script:Launched.OnComplete ([PSCustomObject]@{ Phase = 'Online' })
+Check "the right server was reported"          ($script:Watched -contains 'srv-y')
+Check "the queue moved on exactly once"        ($script:Advanced -eq 1)
+
+
+# =============================================================================
+Section "Active Directory import"
+# Same defect: this ran inside a completion closure, where $script:ServerData
+# and $window are empty, so every name looked new and the add hit nothing.
+# =============================================================================
+Invoke-Expression (Get-FunctionText -Name 'Complete-ADImport')
+
+function New-ServerEntry    { param([string]$Name) [PSCustomObject]@{ ServerName = $Name.ToUpper() } }
+function Update-ServerCount { }
+
+function Reset-Grid {
+    param([string[]]$Existing = @())
+    $script:ServerData = [System.Collections.ObjectModel.ObservableCollection[PSObject]]::new()
+    foreach ($e in $Existing) { $script:ServerData.Add((New-ServerEntry -Name $e)) }
+    $script:Logged = @()
+}
+
+Case "servers found in AD are added"
+Reset-Grid
+Complete-ADImport -Result ([PSCustomObject]@{ Success = $true; Servers = @('srv-1','srv-2'); Error = $null })
+Check "both were added"                        ($script:ServerData.Count -eq 2)
+Check "names are normalised"                   (@($script:ServerData.ServerName) -contains 'SRV-1')
+Check "the count is logged"                    ((Get-LoggedLike '*added 2 new*').Count -eq 1)
+
+Case "servers already in the grid are not duplicated"
+Reset-Grid -Existing @('srv-1')
+Complete-ADImport -Result ([PSCustomObject]@{ Success = $true; Servers = @('SRV-1','srv-2'); Error = $null })
+Check "only the new one was added"             ($script:ServerData.Count -eq 2)
+Check "the duplicate was skipped"              ((Get-LoggedLike '*added 1 new*').Count -eq 1)
+
+Case "a failed query is reported, not swallowed"
+Reset-Grid
+Complete-ADImport -Result ([PSCustomObject]@{ Success = $false; Servers = @(); Error = 'AD server unreachable' })
+Check "nothing was added"                      ($script:ServerData.Count -eq 0)
+Check "the failure is an error in the log"     ((Get-LoggedLike 'ERROR|*AD server unreachable*').Count -eq 1)
 
 
 # =============================================================================
