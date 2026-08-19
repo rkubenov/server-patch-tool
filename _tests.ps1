@@ -19,12 +19,17 @@
       3. Credential selection  - a server must use its own credential, and a
                                  credential that no longer exists must not be
                                  substituted silently.
-      4. Install time limit    - the toolbar setting is read, with a sane
+      4. Credential removal    - a deleted account must not come back after a
+                                 restart, including the last one.
+      5. Post-reboot monitor   - losing the monitor must not be reported as a
+                                 broken server, and never without a reason.
+      6. Sequential queues     - the "run in progress" flags must be cleared
+                                 when the queue drains, closures included.
+      7. Install time limit    - the toolbar setting is read, with a sane
                                  fallback.
 
-    Not covered: anything that talks to a server, and the credential removal
-    handler - its logic lives inside a Click handler that opens a dialog, so it
-    cannot be driven headlessly without extracting it into a function first.
+    Not covered: anything that talks to a live server, and the UI event
+    handlers whose logic still sits inside the handler itself.
 
     Exits with code 1 if any check fails.
 .NOTES
@@ -467,6 +472,60 @@ $script:RebootQueue.Clear()
 $callback = { param($result) Step-RebootQueue }.GetNewClosure()
 & $callback 'ignored'
 Check "the flag was cleared from inside a closure" (-not $script:RebootQueueRunning)
+
+
+# =============================================================================
+Section "Post-reboot monitor"
+# Losing the monitor said nothing about the server, yet the tool marked it
+# broken and stopped watching - and logged "Monitor error -" with nothing after
+# the dash, so the cause could not be worked out afterwards either.
+# =============================================================================
+Invoke-Expression (Get-FunctionText -Name 'Complete-RebootMonitor')
+
+function Invoke-Monitor {
+    param($Monitor)
+    $script:Props = @{}; $script:Rescans = @(); $script:Logged = @()
+    Complete-RebootMonitor -ServerName 'srv-r' -Monitor $Monitor
+}
+
+Case "the server came back"
+Invoke-Monitor ([PSCustomObject]@{ Phase = 'Online'; Error = $null; Attempts = 7 })
+Check "status says it is back"                 ($script:Props.Status -eq 'Back Online')
+Check "the reboot flag is cleared"             ($script:Props.RebootRequired -eq 'No')
+Check "a post-reboot scan was started"         ($script:Rescans -contains 'srv-r')
+
+Case "the monitor job returned nothing at all"
+Invoke-Monitor $null
+Check "the server is not declared broken"      ($script:Props.Status -ne 'Error')
+Check "the reason is spelled out"              ($script:Props.Details -match 'returned no result')
+Check "the tool keeps looking, by scanning"    ($script:Rescans -contains 'srv-r')
+Check "it is logged as a warning, not an error" ((Get-LoggedLike 'WARN|*lost track*').Count -eq 1)
+Check "the log line is never left empty"       ((Get-LoggedLike 'WARN|*- ; *').Count -eq 0)
+
+Case "the monitor failed without saying why"
+Invoke-Monitor ([PSCustomObject]@{ Phase = 'Error'; Error = ''; Attempts = 1 })
+Check "the phase is named instead"             ($script:Props.Details -match "reported 'Error'")
+Check "the tool keeps looking, by scanning"    ($script:Rescans -contains 'srv-r')
+
+Case "the monitor failed and said why"
+Invoke-Monitor ([PSCustomObject]@{ Phase = 'Error'; Error = 'CimException: RPC server unavailable'; Attempts = 3 })
+Check "the reason survives to the grid"        ($script:Props.Details -match 'RPC server unavailable')
+Check "the reason survives to the log"         ((Get-LoggedLike '*RPC server unavailable*').Count -eq 1)
+
+Case "a result with no phase at all"
+Invoke-Monitor ([PSCustomObject]@{ Error = $null })
+Check "it is still explained"                  ($script:Props.Details -match 'carried no phase')
+Check "the tool keeps looking, by scanning"    ($script:Rescans -contains 'srv-r')
+
+Case "the server never came back"
+Invoke-Monitor ([PSCustomObject]@{ Phase = 'Timeout'; Error = 'Server did not come back within 30 minutes.' })
+Check "status says offline"                    ($script:Props.Status -eq 'Offline')
+Check "no scan is attempted against a dead host" ($script:Rescans.Count -eq 0)
+
+Case "the server pings but WinRM is not up"
+Invoke-Monitor ([PSCustomObject]@{ Phase = 'WinRMTimeout'; Error = 'Server answers ping but no completed reboot was confirmed within 30 minutes.' })
+Check "status says partially online"           ($script:Props.Status -eq 'Partially Online')
+Check "the detail explains what is missing"    ($script:Props.Details -match 'WinRM is not ready')
 
 
 # =============================================================================
