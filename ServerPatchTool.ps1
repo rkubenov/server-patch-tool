@@ -352,6 +352,19 @@ if (-not (Test-Path -LiteralPath $script:LogDir)) {
                         <ComboBoxItem Content="180 min"/>
                         <ComboBoxItem Content="240 min"/>
                     </ComboBox>
+                    <TextBlock Text="Reboot:" Foreground="#a6adc8" VerticalAlignment="Center"
+                               Margin="10,0,4,0" FontSize="12"
+                               ToolTip="How long to watch for a server to come back"/>
+                    <ComboBox x:Name="cboRebootTimeout" Width="72" VerticalAlignment="Center"
+                              SelectedIndex="1"
+                              ToolTip="How long to watch for a server to come back after a reboot. A server that applies a cumulative update while booting can take far longer than the default. Running out of time does not cancel anything - the server is simply no longer watched.">
+                        <ComboBoxItem Content="15 min"/>
+                        <ComboBoxItem Content="30 min"/>
+                        <ComboBoxItem Content="45 min"/>
+                        <ComboBoxItem Content="60 min"/>
+                        <ComboBoxItem Content="90 min"/>
+                        <ComboBoxItem Content="120 min"/>
+                    </ComboBox>
                     <Border Width="1" Background="#45475a" Margin="8,2"/>
                     <Button x:Name="btnScanSelected" Content="Scan Selected" Style="{StaticResource AccentButton}"
                             ToolTip="Check for updates on checked servers only"/>
@@ -1232,6 +1245,20 @@ function Get-InstallTimeout {
     return ($minutes * 60)
 }
 
+# How long to keep watching for a server to come back. This used to be 30
+# minutes hard-coded inside the monitor, which is short for a server that
+# applies a cumulative update while booting - and unlike the install limit
+# there was no way to raise it.
+$script:RebootTimeoutDefault = 1800   # 30 min
+
+function Get-RebootTimeout {
+    $item = $ui.cboRebootTimeout.SelectedItem
+    if (-not $item) { return $script:RebootTimeoutDefault }
+    $minutes = [int]($item.Content -replace '\D')
+    if ($minutes -lt 1) { return $script:RebootTimeoutDefault }
+    return ($minutes * 60)
+}
+
 # Reboot: triggers the restart and records the boot time beforehand, so the
 # monitor can later prove the machine really came back rather than guessing.
 $script:RebootScript = {
@@ -1272,7 +1299,7 @@ $script:RebootScript = {
 # starting late (e.g. queued behind other jobs in the runspace pool): it does
 # not need to observe the downtime window itself.
 $script:RebootMonitorScript = {
-    param([string]$ServerName, [PSCredential]$Credential, $BootBefore)
+    param([string]$ServerName, [PSCredential]$Credential, $BootBefore, [int]$TimeoutSeconds = 1800)
 
     # Probe over WinRM rather than ICMP: ping is commonly blocked by policy on
     # servers, and that made the old monitor report healthy hosts as offline.
@@ -1305,8 +1332,10 @@ $script:RebootMonitorScript = {
     $lastIssue = $null
 
     try {
-        # Cumulative updates applied during shutdown/startup can take a while.
-        $deadline = (Get-Date).AddMinutes(30)
+        # Cumulative updates applied during shutdown/startup can take a while,
+        # so how long to keep watching is the operator's call, not a constant.
+        $minutes  = [int]($TimeoutSeconds / 60)
+        $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
 
         while ((Get-Date) -lt $deadline) {
             Start-Sleep -Seconds 10
@@ -1351,13 +1380,13 @@ $script:RebootMonitorScript = {
         if ($pingable) {
             return [PSCustomObject]@{
                 Phase    = "WinRMTimeout"
-                Error    = "Server answers ping but no completed reboot was confirmed within 30 minutes.$trail"
+                Error    = "Server answers ping but no completed reboot was confirmed within $minutes minutes.$trail"
                 Attempts = $attempts
             }
         }
         return [PSCustomObject]@{
             Phase    = "Timeout"
-            Error    = "Server did not come back within 30 minutes.$trail"
+            Error    = "Server did not come back within $minutes minutes.$trail"
             Attempts = $attempts
         }
     } catch {
@@ -1394,6 +1423,82 @@ function Start-AsyncJob {
 }
 
 # Timer to check for completed async jobs
+# ── Deferred re-checks ────────────────────────────────────────────────────────
+# A server left as "Still installing" never corrects itself: the install carries
+# on under its own scheduled task and nothing reports back, so the row kept that
+# status until somebody scanned by hand. These re-checks are how it eventually
+# tells the truth on its own.
+$script:PendingRechecks = [System.Collections.Generic.List[PSObject]]::new()
+$script:RecheckInterval = 10   # minutes between attempts
+$script:RecheckAttempts = 6    # so roughly an hour of trying in total
+
+function Add-PendingRecheck {
+    param([string]$ServerName)
+
+    Remove-PendingRecheck -ServerName $ServerName
+    $script:PendingRechecks.Add([PSCustomObject]@{
+        ServerName = $ServerName
+        DueAt      = (Get-Date).AddMinutes($script:RecheckInterval)
+        Remaining  = $script:RecheckAttempts
+    })
+    Write-Log "$ServerName : will re-check in $($script:RecheckInterval) min to find out how the install ended"
+}
+
+function Remove-PendingRecheck {
+    param([string]$ServerName)
+    foreach ($p in @($script:PendingRechecks)) {
+        if ($p.ServerName -eq $ServerName) { $script:PendingRechecks.Remove($p) | Out-Null }
+    }
+}
+
+# Fires the re-checks that have come due. Walks a snapshot: the scan it starts
+# can finish and change this list while the loop is still running.
+function Step-PendingRechecks {
+    $now = Get-Date
+
+    foreach ($p in @($script:PendingRechecks)) {
+        if ($p.DueAt -gt $now) { continue }
+
+        $entry = $script:ServerData | Where-Object { $_.ServerName -eq $p.ServerName } | Select-Object -First 1
+        if (-not $entry) {
+            $script:PendingRechecks.Remove($p) | Out-Null
+            continue
+        }
+
+        # A status that only a completed scan can produce means the question
+        # has been answered - by this re-check or by the operator.
+        if ($entry.Status -like "Available*" -or
+            $entry.Status -in @("Up to date", "Reboot Required", "Completed with errors")) {
+            $script:PendingRechecks.Remove($p) | Out-Null
+            Write-Log "$($p.ServerName) : install confirmed as finished - $($entry.Status)"
+            continue
+        }
+
+        # Busy with something right now, including the previous re-check. Come
+        # back shortly rather than spending an attempt on a server that cannot
+        # answer yet.
+        if ($entry.Status -in @("Scanning...", "Installing...", "Rebooting...")) {
+            $p.DueAt = $now.AddMinutes(1)
+            continue
+        }
+
+        $p.Remaining--
+        if ($p.Remaining -lt 0) {
+            $script:PendingRechecks.Remove($p) | Out-Null
+            $waited = $script:RecheckAttempts * $script:RecheckInterval
+            Update-ServerEntry -ServerName $p.ServerName -Properties @{
+                Details = "Still unconfirmed after $waited minutes of re-checks. Scan manually once the server is free."
+            }
+            Write-Log "$($p.ServerName) : gave up re-checking after $waited min - scan manually" "WARN"
+            continue
+        }
+
+        $p.DueAt = $now.AddMinutes($script:RecheckInterval)
+        Write-Log "$($p.ServerName) : re-checking whether the install has finished"
+        Invoke-ScanServer -ServerName $p.ServerName -NoProgress
+    }
+}
+
 $script:JobTimer = [System.Windows.Threading.DispatcherTimer]::new()
 $script:JobTimer.Interval = [TimeSpan]::FromMilliseconds(500)
 $script:JobTimer.Add_Tick({
@@ -1417,6 +1522,8 @@ $script:JobTimer.Add_Tick({
             $job.PowerShell.Dispose()
         }
     }
+
+    Step-PendingRechecks
 
     # Update progress
     if ($script:ActiveJobs.Count -eq 0) {
@@ -1506,9 +1613,10 @@ function Complete-InstallResult {
         # "Error" here would be a lie and would hide a run that is still going.
         Update-ServerEntry -ServerName $ServerName -Properties @{
             Status  = "Still installing"
-            Details = "Stopped watching after the time limit. The install is still running on the server - rescan later for the result. $($Result.Error)"
+            Details = "Stopped watching after the time limit. The install is still running on the server; re-checking every $($script:RecheckInterval) min. $($Result.Error)"
         }
         Write-Log "$ServerName : $($Result.Error)" "WARN"
+        Add-PendingRecheck -ServerName $ServerName
     } else {
         Update-ServerEntry -ServerName $ServerName -Properties @{
             Status  = "Error"
@@ -1589,6 +1697,7 @@ function Stop-AllOperations {
     $script:RebootQueue.Clear()
     $script:SequentialRunning  = $false
     $script:RebootQueueRunning = $false
+    $script:PendingRechecks.Clear()
 
     $stopped = $script:ActiveJobs.Count
     foreach ($job in @($script:ActiveJobs)) {
@@ -1727,7 +1836,7 @@ function Invoke-RebootServer {
 
             # Launch the post-reboot monitor
             $monCred = Get-ServerCredential -ServerName $ServerName
-            Start-AsyncJob -ScriptBlock $script:RebootMonitorScript -Arguments @($ServerName, $monCred, $r.BootBefore) -OnComplete {
+            Start-AsyncJob -ScriptBlock $script:RebootMonitorScript -Arguments @($ServerName, $monCred, $r.BootBefore, (Get-RebootTimeout)) -OnComplete {
                 param($monResult)
                 Complete-RebootMonitor -ServerName $ServerName -Monitor ($monResult | Select-Object -First 1)
             }.GetNewClosure()
@@ -2084,7 +2193,7 @@ function Invoke-RebootServerSequential {
             Write-Log "$ServerName : Reboot initiated - monitoring until back online"
 
             $monCred = Get-ServerCredential -ServerName $ServerName
-            Start-AsyncJob -ScriptBlock $script:RebootMonitorScript -Arguments @($ServerName, $monCred, $r.BootBefore) -OnComplete {
+            Start-AsyncJob -ScriptBlock $script:RebootMonitorScript -Arguments @($ServerName, $monCred, $r.BootBefore, (Get-RebootTimeout)) -OnComplete {
                 param($monResult)
                 Complete-RebootMonitor -ServerName $ServerName -Monitor ($monResult | Select-Object -First 1)
                 Step-RebootQueue
@@ -2127,7 +2236,7 @@ function Start-RebootParallel {
                 Write-Log "$sn : Reboot initiated - monitoring until back online"
 
                 $monCred = Get-ServerCredential -ServerName $sn
-                Start-AsyncJob -ScriptBlock $script:RebootMonitorScript -Arguments @($sn, $monCred, $r.BootBefore) -OnComplete {
+                Start-AsyncJob -ScriptBlock $script:RebootMonitorScript -Arguments @($sn, $monCred, $r.BootBefore, (Get-RebootTimeout)) -OnComplete {
                     param($monResult)
                     Complete-RebootMonitor -ServerName $sn -Monitor ($monResult | Select-Object -First 1)
                 }.GetNewClosure()

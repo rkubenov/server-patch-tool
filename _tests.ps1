@@ -25,8 +25,10 @@
                                  broken server, and never without a reason.
       6. Sequential queues     - the "run in progress" flags must be cleared
                                  when the queue drains, closures included.
-      7. Install time limit    - the toolbar setting is read, with a sane
-                                 fallback.
+      7. Deferred re-checks    - a server the tool stopped watching must be
+                                 asked again, and eventually given up on.
+      8. Time limits           - the install and reboot settings are read,
+                                 with sane fallbacks.
 
     Not covered: anything that talks to a live server, and the UI event
     handlers whose logic still sits inside the handler itself.
@@ -103,6 +105,16 @@ function Write-Log { param($Message, $Level = 'INFO') $script:Logged += "$Level|
 function Show-Progress { param([bool]$Visible) }
 function Step-Progress { }
 function Update-StatusBar { param($Text) }
+
+# The re-check settings are real, so the messages that quote them read the same
+# here as they do in the tool. The two functions start as stubs because the job
+# timer and the install handler call them long before the section that tests
+# them; that section replaces these with the shipped versions.
+Invoke-Expression (Get-AssignmentText -VariablePath '$script:PendingRechecks')
+Invoke-Expression (Get-AssignmentText -VariablePath '$script:RecheckInterval')
+Invoke-Expression (Get-AssignmentText -VariablePath '$script:RecheckAttempts')
+function Add-PendingRecheck   { param([string]$ServerName) }
+function Step-PendingRechecks { }
 
 function Get-LoggedLike { param([string]$Pattern) @($script:Logged | Where-Object { $_ -like $Pattern }) }
 
@@ -529,7 +541,96 @@ Check "the detail explains what is missing"    ($script:Props.Details -match 'Wi
 
 
 # =============================================================================
-Section "Install time limit"
+Section "Deferred re-checks"
+# An install the tool stopped watching used to leave the row reading "Still
+# installing" until somebody scanned by hand. These re-checks answer it instead.
+# =============================================================================
+Invoke-Expression (Get-FunctionText   -Name 'Add-PendingRecheck')
+Invoke-Expression (Get-FunctionText   -Name 'Remove-PendingRecheck')
+Invoke-Expression (Get-FunctionText   -Name 'Step-PendingRechecks')
+
+function Set-Row {
+    param([string]$Status)
+    $script:ServerData = @([PSCustomObject]@{ ServerName = 'srv-slow'; CredentialLabel = ''; Status = $Status })
+    $script:Rescans = @(); $script:Logged = @(); $script:Props = @{}
+}
+function Get-Recheck { @($script:PendingRechecks | Where-Object { $_.ServerName -eq 'srv-slow' })[0] }
+function Set-Due     { (Get-Recheck).DueAt = (Get-Date).AddMinutes(-1) }
+
+Case "an install that ran out of time queues a re-check"
+$script:PendingRechecks.Clear()
+Set-Row 'Still installing'
+Add-PendingRecheck -ServerName 'srv-slow'
+Check "one re-check is queued"                 ($script:PendingRechecks.Count -eq 1)
+Check "it is not due immediately"              ((Get-Recheck).DueAt -gt (Get-Date))
+Check "the operator is told"                   ((Get-LoggedLike '*will re-check in*').Count -eq 1)
+
+Case "queueing the same server twice does not double up"
+Add-PendingRecheck -ServerName 'srv-slow'
+Check "still only one re-check"                ($script:PendingRechecks.Count -eq 1)
+
+Case "nothing happens before it is due"
+Set-Row 'Still installing'
+Step-PendingRechecks
+Check "no scan was started"                    ($script:Rescans.Count -eq 0)
+Check "the re-check is still queued"           ($script:PendingRechecks.Count -eq 1)
+
+Case "the re-check fires once it is due"
+Set-Row 'Still installing'
+Set-Due
+$before = (Get-Recheck).Remaining
+Step-PendingRechecks
+Check "the server was scanned"                 ($script:Rescans -contains 'srv-slow')
+Check "an attempt was spent"                   ((Get-Recheck).Remaining -eq ($before - 1))
+Check "the next attempt is scheduled"          ((Get-Recheck).DueAt -gt (Get-Date))
+
+Case "a server that is busy does not burn an attempt"
+Set-Row 'Scanning...'
+Set-Due
+$before = (Get-Recheck).Remaining
+Step-PendingRechecks
+Check "no scan was piled on top"               ($script:Rescans.Count -eq 0)
+Check "the attempt was not spent"              ((Get-Recheck).Remaining -eq $before)
+Check "it will look again shortly"             ((Get-Recheck).DueAt -gt (Get-Date))
+
+Case "a confirmed install ends the re-checks"
+Set-Row 'Up to date'
+Set-Due
+Step-PendingRechecks
+Check "the re-check is dropped"                ($script:PendingRechecks.Count -eq 0)
+Check "no further scan was started"            ($script:Rescans.Count -eq 0)
+Check "the outcome is logged"                  ((Get-LoggedLike '*confirmed as finished*').Count -eq 1)
+
+Case "a server that stays silent is eventually given up on"
+$script:PendingRechecks.Clear()
+Set-Row 'Still installing'
+Add-PendingRecheck -ServerName 'srv-slow'
+$script:Logged = @()
+(Get-Recheck).Remaining = 1
+Set-Due
+Step-PendingRechecks
+Check "the last attempt still scans"           ($script:Rescans -contains 'srv-slow')
+Check "no attempts are left"                   ((Get-Recheck).Remaining -eq 0)
+Set-Row 'Still installing'
+Set-Due
+Step-PendingRechecks
+Check "the re-check is dropped"                ($script:PendingRechecks.Count -eq 0)
+Check "giving up is a warning"                 ((Get-LoggedLike 'WARN|*gave up re-checking*').Count -eq 1)
+Check "the row says what to do next"           ($script:Props.Details -match 'Scan manually')
+
+Case "an install that timed out schedules its own re-check"
+$script:PendingRechecks.Clear()
+Set-Row 'Still installing'
+Complete-InstallResult -ServerName 'srv-slow' -Result ([PSCustomObject]@{
+    Success = $false; TimedOut = $true; TaskName = 'SPT_Install_0000'
+    Error = "Install still going after 90 minutes"; Message = 'Still running'
+})
+Check "a re-check was queued by the handler"   ($script:PendingRechecks.Count -eq 1)
+Check "the row says re-checking is happening"  ($script:Props.Details -match 're-checking every')
+
+
+# =============================================================================
+Section "Install and reboot time limits"
 # =============================================================================
 Invoke-Expression (Get-AssignmentText -VariablePath '$script:InstallTimeoutDefault')
 Invoke-Expression (Get-FunctionText   -Name 'Get-InstallTimeout')
@@ -554,6 +655,28 @@ Set-LimitBox -Content $null
 Check "nothing selected gives the default"     ((Get-InstallTimeout) -eq $script:InstallTimeoutDefault)
 Set-LimitBox -Content 'not a number'
 Check "unparsable text gives the default"      ((Get-InstallTimeout) -eq $script:InstallTimeoutDefault)
+
+Invoke-Expression (Get-AssignmentText -VariablePath '$script:RebootTimeoutDefault')
+Invoke-Expression (Get-FunctionText   -Name 'Get-RebootTimeout')
+
+function Set-RebootBox {
+    param($Content)
+    $item = if ($null -eq $Content) { $null } else { [PSCustomObject]@{ Content = $Content } }
+    $script:ui = @{ cboRebootTimeout = [PSCustomObject]@{ SelectedItem = $item } }
+}
+
+Case "how long to watch for a reboot is the operator's call"
+Set-RebootBox -Content '45 min'
+Check "45 min becomes 2700 seconds"            ((Get-RebootTimeout) -eq 2700)
+Set-RebootBox -Content '120 min'
+Check "120 min becomes 7200 seconds"           ((Get-RebootTimeout) -eq 7200)
+
+Case "the reboot default matches what the monitor used to hard-code"
+Check "default is 30 minutes"                  ($script:RebootTimeoutDefault -eq 1800)
+Set-RebootBox -Content $null
+Check "nothing selected gives the default"     ((Get-RebootTimeout) -eq $script:RebootTimeoutDefault)
+Set-RebootBox -Content 'not a number'
+Check "unparsable text gives the default"      ((Get-RebootTimeout) -eq $script:RebootTimeoutDefault)
 
 
 # =============================================================================
