@@ -287,6 +287,36 @@ Check "the cause is kept"                      ($script:Props.Details -match 'Wi
 Check "no rescan after a failure"              ($script:Rescans.Count -eq 0)
 
 
+Case "starting an install clears the count from last time"
+# The count is only written back on success, so a run that fails outright would
+# otherwise leave the previous number on screen as if it had just been achieved.
+Invoke-Expression (Get-FunctionText -Name 'Invoke-InstallServer')
+Invoke-Expression (Get-FunctionText -Name 'Invoke-InstallServerSequential')
+
+function Ensure-Credential   { $true }
+function Get-ServerCredential { param([string]$ServerName) "cred" }
+function Get-InstallTimeout  { 5400 }
+function Start-AsyncJob      { param($ScriptBlock, $Arguments, $OnComplete) }
+$script:RunAsSystemScript = { }
+$script:InstallPayload    = "payload"
+
+$script:Props = @{}
+Invoke-InstallServer -ServerName 'srv-again'
+Check "the previous count is cleared"          ($script:Props.Installed -eq '-')
+Check "the row says an install is running"     ($script:Props.Status -eq 'Installing...')
+
+$script:Props = @{}
+Invoke-InstallServerSequential -ServerName 'srv-again'
+Check "the same holds in sequential mode"      ($script:Props.Installed -eq '-')
+
+Case "a failed install leaves no stale count behind"
+$script:Props = @{}
+Complete-InstallResult -ServerName 'srv-again' -Result ([PSCustomObject]@{
+    Success = $false; Error = 'WinRM connection failed'
+})
+Check "the handler does not write a count"     (-not $script:Props.ContainsKey('Installed'))
+
+
 # =============================================================================
 Section "Credential selection"
 # Removing a credential could leave servers pointing at it; the substitute must

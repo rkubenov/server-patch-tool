@@ -1847,8 +1847,13 @@ function Invoke-InstallServer {
     if (-not (Ensure-Credential)) { return }
 
     Update-ServerEntry -ServerName $ServerName -Properties @{
-        Status  = "Installing..."
-        Details = "Downloading and installing updates..."
+        Status    = "Installing..."
+        # Clear the count from the previous run. It is only written back when an
+        # install succeeds, so leaving it meant a run that failed outright - a
+        # dropped connection, a refusing update agent - kept showing yesterday's
+        # number, as if those updates had just gone on.
+        Installed = "-"
+        Details   = "Downloading and installing updates..."
     }
     Write-Log "Installing updates on $ServerName..."
 
@@ -2094,8 +2099,9 @@ function Invoke-InstallServerSequential {
     }
 
     Update-ServerEntry -ServerName $ServerName -Properties @{
-        Status  = "Installing..."
-        Details = "Downloading and installing updates... (sequential)"
+        Status    = "Installing..."
+        Installed = "-"
+        Details   = "Downloading and installing updates... (sequential)"
     }
     Write-Log "Installing updates on $ServerName (sequential mode)..."
 
