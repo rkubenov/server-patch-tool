@@ -490,6 +490,7 @@ Check "the queue was not advanced"             ($script:Advanced -eq 0)
 Case "a sequential reboot hands the queue on"
 $script:Launched = $null; $script:Watched = @(); $script:Advanced = 0
 Start-RebootMonitor -ServerName 'srv-y' -BootBefore $baseline -Sequential
+Check "the queue waits while the watch runs"   ($script:Advanced -eq 0)
 & $script:Launched.OnComplete ([PSCustomObject]@{ Phase = 'Online' })
 Check "the right server was reported"          ($script:Watched -contains 'srv-y')
 Check "the queue moved on exactly once"        ($script:Advanced -eq 1)
