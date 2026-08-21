@@ -76,6 +76,43 @@ try {
 }
 
 Write-Host ""
+Write-Host "=== Remote payloads ===" -ForegroundColor Cyan
+# The payloads run on the servers and live inside here-strings, so the parse
+# above cannot see into them: a syntax error in one would surface only on a
+# live server, halfway through a maintenance window.
+$fileAst = [System.Management.Automation.Language.Parser]::ParseFile($target, [ref]$null, [ref]$null)
+$payloads = @($fileAst.FindAll({ param($n)
+    $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+    $n.Left.Extent.Text -like '$script:*Payload' }, $true))
+
+if ($payloads.Count -eq 0) {
+    Write-Host "  ERROR - no payloads found to check" -ForegroundColor Red
+    $failed = $true
+} else {
+    foreach ($p in $payloads) {
+        $name = $p.Left.Extent.Text
+        $str  = $p.Right.FindAll({ param($n)
+            $n -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $false) |
+            Select-Object -First 1
+        if (-not $str) {
+            Write-Host "  ERROR - $name is not a plain here-string" -ForegroundColor Red
+            $failed = $true
+            continue
+        }
+        $pErrors = $null
+        [System.Management.Automation.Language.Parser]::ParseInput($str.Value, [ref]$null, [ref]$pErrors) | Out-Null
+        if ($pErrors -and $pErrors.Count -gt 0) {
+            $failed = $true
+            foreach ($e in $pErrors) {
+                Write-Host ("  {0} line {1,-4} {2}" -f $name, $e.Extent.StartLineNumber, $e.Message) -ForegroundColor Red
+            }
+        } else {
+            Write-Host "  OK - $name parses" -ForegroundColor Green
+        }
+    }
+}
+
+Write-Host ""
 Write-Host "=== Encoding ===" -ForegroundColor Cyan
 # These scripts are stored without a BOM, so anything outside ASCII is decoded
 # with the ANSI codepage by Windows PowerShell 5.1 and will be corrupted.
