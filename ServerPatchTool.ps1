@@ -1025,10 +1025,23 @@ try {
             # Per-update outcomes are kept, not just counted: the caller shows
             # which KBs failed, and "how many succeeded" alone cannot tell an
             # operator whether a server still needs attention.
+            # ResultCode only ever says "Failed". The HRESULT next to it is what
+            # says why, and the update agent already has it - without it the
+            # operator is sent to the CBS log for something that was known here.
+            $hints = @{
+                '0x80070070' = 'not enough disk space'
+                '0x80070005' = 'access denied'
+                '0x80240016' = 'another install is in progress, or a reboot is pending'
+                '0x800F081F' = 'component store source files are missing'
+                '0x800F0922' = 'installer failed - often space on the system partition'
+                '0x8024200B' = 'the update handler failed to install the update'
+            }
+
             $ok = 0; $fail = 0
             $okList = @(); $failList = @()
             for ($i = 0; $i -lt $toInstall.Count; $i++) {
-                $rc = $installResult.GetUpdateResult($i).ResultCode
+                $ur    = $installResult.GetUpdateResult($i)
+                $rc    = $ur.ResultCode
                 $title = $toInstall.Item($i).Title
                 if ($rc -eq 2) {
                     $ok++
@@ -1036,8 +1049,17 @@ try {
                     Log "  OK: $title"
                 } else {
                     $fail++
-                    $failList += "$title (result code $rc)"
-                    Log "  FAILED (code $rc): $title"
+                    # An aborted update can carry no HRESULT at all; saying
+                    # 0x00000000 there would be worse than saying nothing.
+                    $hex = if ($ur.HResult -ne 0) { '0x{0:X8}' -f $ur.HResult } else { $null }
+                    if ($hex) {
+                        $why = if ($hints.ContainsKey($hex)) { " - $($hints[$hex])" } else { "" }
+                        $failList += "$title ($hex$why)"
+                        Log "  FAILED: $title  hresult=$hex resultcode=$rc$why"
+                    } else {
+                        $failList += "$title (result code $rc)"
+                        Log "  FAILED (code $rc, no hresult): $title"
+                    }
                 }
             }
 

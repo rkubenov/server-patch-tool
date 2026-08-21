@@ -232,13 +232,16 @@ Case "three updates installed, two failed, no reboot"
 Invoke-Install -ServerName 'srv-a' -Result @{
     Success = $true; InstalledCount = 3; FailedCount = 2; RebootRequired = $false
     InstalledTitles = @('KB1', 'KB2', 'KB3')
-    FailedTitles    = @('Update X (result code 4)', 'Update Y (result code 4)')
+    FailedTitles    = @('Update X (0x800F0922 - installer failed - often space on the system partition)',
+                        'Update Y (0x80070070 - not enough disk space)')
     Message = 'Installed 3 of 5 update(s), 2 failed'; Error = '2 update(s) failed to install'
 }
 Check "status is not a clean one"              ($script:Props.Status -eq 'Completed with errors')
 Check "the two failures count as available"    ($script:Props.Available -eq '2')
 Check "installed count is reported"            ($script:Props.Installed -eq '3')
 Check "details name the failed updates"        ($script:Props.Details -match 'Update X' -and $script:Props.Details -match 'Update Y')
+Check "the failure code reaches the grid"      ($script:Props.Details -match '0x800F0922')
+Check "the failure code reaches the log"       ((Get-LoggedLike '*0x80070070*').Count -eq 1)
 Check "each failure is logged as a warning"    ((Get-LoggedLike 'WARN|*').Count -ge 2)
 Check "a confirming rescan was started"        ($script:Rescans -contains 'srv-a')
 
