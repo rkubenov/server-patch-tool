@@ -10,13 +10,13 @@
     Run as: powershell -ExecutionPolicy Bypass -File ServerPatchTool.ps1
 #>
 
-# ── Assemblies ────────────────────────────────────────────────────────────────
+# -- Assemblies ----------------------------------------------------------------
 Add-Type -AssemblyName PresentationFramework
 Add-Type -AssemblyName PresentationCore
 Add-Type -AssemblyName WindowsBase
 Add-Type -AssemblyName System.Windows.Forms
 
-# ── Persistent server list file ──────────────────────────────────────────────
+# -- Persistent server list file ----------------------------------------------
 $script:DataFile = Join-Path $PSScriptRoot "servers.json"
 
 # Credentials live under the user profile rather than next to the script: the
@@ -25,7 +25,7 @@ $script:DataFile = Join-Path $PSScriptRoot "servers.json"
 $script:CredDir  = Join-Path $env:LOCALAPPDATA "ServerPatchTool"
 $script:CredFile = Join-Path $script:CredDir "credentials.json"
 
-# ── Log file ─────────────────────────────────────────────────────────────────
+# -- Log file -----------------------------------------------------------------
 # One file per day next to the script. The in-window log is cleared on close,
 # which left no record of what was patched during a change window.
 $script:LogDir  = Join-Path $PSScriptRoot "logs"
@@ -34,7 +34,7 @@ if (-not (Test-Path -LiteralPath $script:LogDir)) {
     New-Item -ItemType Directory -Path $script:LogDir -Force | Out-Null
 }
 
-# ── XAML UI Definition ────────────────────────────────────────────────────────
+# -- XAML UI Definition --------------------------------------------------------
 [xml]$xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
@@ -473,11 +473,11 @@ if (-not (Test-Path -LiteralPath $script:LogDir)) {
 </Window>
 "@
 
-# ── Create Window ─────────────────────────────────────────────────────────────
+# -- Create Window -------------------------------------------------------------
 $reader = [System.Xml.XmlNodeReader]::new($xaml)
 $window = [Windows.Markup.XamlReader]::Load($reader)
 
-# ── Resolve named controls ───────────────────────────────────────────────────
+# -- Resolve named controls ---------------------------------------------------
 $ui = @{}
 $xaml.SelectNodes('//*[@*[contains(translate(name(),"x","X"),"Name")]]') | ForEach-Object {
     $name = $_.Name
@@ -485,7 +485,7 @@ $xaml.SelectNodes('//*[@*[contains(translate(name(),"x","X"),"Name")]]') | ForEa
     if ($name) { $ui[$name] = $window.FindName($name) }
 }
 
-# ── State ─────────────────────────────────────────────────────────────────────
+# -- State ---------------------------------------------------------------------
 $script:Credentials  = @{}   # Key = "DOMAIN\user" (label), Value = PSCredential object
 $script:DefaultCredentialLabel = $null  # label of the default/first credential added
 $script:ServerData   = [System.Collections.ObjectModel.ObservableCollection[PSObject]]::new()
@@ -494,11 +494,11 @@ $script:ActiveJobs   = [System.Collections.Generic.List[PSObject]]::new()
 
 $ui.dgServers.ItemsSource = $script:ServerData
 
-# ── Sequential queue state ────────────────────────────────────────────────────
+# -- Sequential queue state ----------------------------------------------------
 $script:SequentialQueue = [System.Collections.Generic.Queue[string]]::new()
 $script:SequentialRunning = $false
 
-# ── Persistent Storage ────────────────────────────────────────────────────────
+# -- Persistent Storage --------------------------------------------------------
 function Save-ServerList {
     # Scan results are persisted too, so a restart no longer wipes the picture
     # of the estate. LastScan travels with them, which is what tells the user
@@ -570,7 +570,7 @@ function Load-ServerList {
     Update-ServerCount
 }
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# -- Helpers -------------------------------------------------------------------
 function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
     $now = Get-Date
@@ -668,7 +668,7 @@ function Get-StatusColor {
     }
 }
 
-# ── Saved credentials (DPAPI) ────────────────────────────────────────────────
+# -- Saved credentials (DPAPI) ------------------------------------------------
 # ConvertFrom-SecureString protects the password with DPAPI under the current
 # user, so the stored blob is worthless to any other Windows account and on any
 # other machine. It is NOT protection against this account: anything running as
@@ -863,7 +863,7 @@ function Ensure-Credential {
     return $true
 }
 
-# ── Initialize Runspace Pool ─────────────────────────────────────────────────
+# -- Initialize Runspace Pool -------------------------------------------------
 # How many servers may be worked on at the same time. Was hardcoded to 10,
 # which is too many for a thin link and too few for a large estate.
 $script:RunspacePoolSize = 10
@@ -894,7 +894,7 @@ function Sync-RunspacePool {
     Write-Log "Max parallel set to $desired"
 }
 
-# ── Remote Operations ─────────────────────────────────────────────────────────
+# -- Remote Operations ---------------------------------------------------------
 # Uses scheduled-task approach: creates a temporary task that runs as SYSTEM on
 # the remote server.  SYSTEM always has full access to the Windows Update Agent
 # COM objects, which avoids the "Access denied" DCOM error that occurs when
@@ -1420,7 +1420,7 @@ $script:RebootMonitorScript = {
     }
 }
 
-# ── Async Job Runner ──────────────────────────────────────────────────────────
+# -- Async Job Runner ----------------------------------------------------------
 function Start-AsyncJob {
     param(
         [ScriptBlock]$ScriptBlock,
@@ -1445,7 +1445,7 @@ function Start-AsyncJob {
 }
 
 # Timer to check for completed async jobs
-# ── Deferred re-checks ────────────────────────────────────────────────────────
+# -- Deferred re-checks --------------------------------------------------------
 # A server left as "Still installing" never corrects itself: the install carries
 # on under its own scheduled task and nothing reports back, so the row kept that
 # status until somebody scanned by hand. These re-checks are how it eventually
@@ -1559,7 +1559,7 @@ $script:JobTimer.Add_Tick({
 })
 $script:JobTimer.Start()
 
-# ── Update server entry in the grid (thread-safe) ────────────────────────────
+# -- Update server entry in the grid (thread-safe) ----------------------------
 function Update-ServerEntry {
     param(
         [string]$ServerName,
@@ -1581,7 +1581,7 @@ function Update-ServerEntry {
     })
 }
 
-# ── Server Operations ─────────────────────────────────────────────────────────
+# -- Server Operations ---------------------------------------------------------
 # Shared tail for install jobs: Invoke-InstallServer and its sequential twin
 # differed only in what they did afterwards.
 function Complete-InstallResult {
@@ -1928,7 +1928,7 @@ function Invoke-RebootServer {
     }.GetNewClosure()
 }
 
-# ── Event Handlers ────────────────────────────────────────────────────────────
+# -- Event Handlers ------------------------------------------------------------
 
 # Add servers
 $ui.btnAddServer.Add_Click({
@@ -2087,7 +2087,7 @@ $ui.btnScanAll.Add_Click({
     }
 })
 
-# ── Sequential Install Logic ──────────────────────────────────────────────────
+# -- Sequential Install Logic --------------------------------------------------
 # Advances the install queue: next server, or wind the run down.
 #
 # This has to be a function rather than a few lines in the completion callback.
@@ -2205,7 +2205,7 @@ $ui.btnInstallAll.Add_Click({
 })
 
 # Helper function to run reboot on a list of servers (used by both Selected and All)
-# ── Sequential Reboot Logic ───────────────────────────────────────────────────
+# -- Sequential Reboot Logic ---------------------------------------------------
 $script:RebootQueue = [System.Collections.Generic.Queue[string]]::new()
 $script:RebootQueueRunning = $false
 
@@ -2530,7 +2530,7 @@ $ui.btnClearLog.Add_Click({
     $ui.txtLog.Clear()
 })
 
-# ── Cleanup on close ─────────────────────────────────────────────────────────
+# -- Cleanup on close ---------------------------------------------------------
 $window.Add_Closed({
     Save-ServerList
     $script:JobTimer.Stop()
@@ -2540,10 +2540,10 @@ $window.Add_Closed({
     if ($script:RunspacePool) { $script:RunspacePool.Dispose() }
 })
 
-# ── Load VisualBasic assembly for InputBox (AD browser) ──────────────────────
+# -- Load VisualBasic assembly for InputBox (AD browser) ----------------------
 try { Add-Type -AssemblyName Microsoft.VisualBasic } catch {}
 
-# ── Launch ────────────────────────────────────────────────────────────────────
+# -- Launch --------------------------------------------------------------------
 # Bring back today's log first, before this session appends anything to it.
 Restore-LogWindow
 
