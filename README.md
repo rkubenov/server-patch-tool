@@ -1,128 +1,146 @@
 # Server Patch Tool
 
-Графический инструмент на PowerShell + WPF для управления обновлениями Windows на серверах в домене AD: проверка доступных обновлений, установка и перезагрузка по списку серверов.
+A PowerShell + WPF desktop tool for driving Windows Updates across domain-joined servers: scan for missing updates, install them, reboot, and confirm the result — all from one grid.
 
-> [!WARNING]
-> **Обкатка частичная.** На тестовом сервере пройден полный цикл: сканирование → установка → перезагрузка → подтверждение возвращения по времени загрузки ОС → повторное сканирование.
->
-> На живых серверах **не проверялись**: отложенные перепроверки долгих установок (`Still installing`), увеличенное время наблюдения за перезагрузкой, отчёт о частично неудавшейся установке (`Completed with errors`), пакетные режимы на нескольких серверах и импорт из Active Directory — последний содержал дефект, из-за которого, судя по коду, не работал вовсе, и исправлен вместе с монитором. Эти сценарии стоит прогнать на тестовом сервере, прежде чем применять инструмент к рабочим.
+> [!NOTE]
+> **Field status.** Scanning, installing across a batch of servers (including a cumulative update that failed on one of them), rebooting, confirming the server really came back, and the follow-up scan have all been exercised against live servers during maintenance windows. Importing from Active Directory and the deferred re-checks that follow an install time-out have not been exercised in the field yet.
 
-## Что умеет
+## What it does
 
-- Проверка доступных обновлений Windows сразу по списку серверов
-- Установка обновлений — параллельно или последовательно, по одному
-- Перезагрузка с подтверждением того, что сервер действительно вернулся
-- Импорт списка серверов из файла или из Active Directory
-- Несколько наборов учётных данных — для разных доменов, с привязкой к конкретным серверам
-- Экспорт результатов в CSV
+- Scan many servers for pending Windows Updates at once
+- Install updates in parallel, or one server at a time
+- Reboot with confirmation that the server actually came back
+- Import the server list from a file or from Active Directory
+- Several credential sets, for different domains, bound to individual servers
+- Export results to CSV
 
-## Требования
+## Requirements
 
 - Windows PowerShell 5.1
-- WinRM (порт 5985), включённый на целевых серверах
-- Учётная запись с правами администратора на целевых серверах
-- Модуль `ActiveDirectory` — только для импорта списка из AD
+- WinRM (port 5985) enabled on the target servers
+- An account with local administrator rights on the targets
+- The `ActiveDirectory` module — only for importing a list from AD
 
-## Запуск
+## Running
 
 ```bash
 powershell.exe -ExecutionPolicy Bypass -NoProfile -File ServerPatchTool.ps1
 ```
 
-Либо через `Launch.bat`.
+Or through `Launch.bat`.
 
-## Как устроена установка обновлений
+## How installing works
 
-Обновления Windows нельзя ставить через обычное удалённое подключение: COM-объекты агента обновлений отказывают делегированному сетевому токену с ошибкой «Access denied».
+Windows Updates cannot be installed over an ordinary remote session: the update agent's COM objects refuse a delegated network token with "Access denied".
 
-Поэтому инструмент подключается к серверу по WinRM, создаёт там временную запланированную задачу от имени `SYSTEM`, и уже она выполняет работу. Результат пишется в JSON-файл, который читается обратно, после чего задача и все временные файлы удаляются — кроме случая, когда истекло время ожидания (см. ниже).
+So the tool connects to the server over WinRM, creates a temporary scheduled task running as `SYSTEM`, and lets that do the work. Results are written to a JSON file which is read back, after which the task and its temporary files are removed — except when the time limit expired (see below).
 
-Рабочий каталог — `%ProgramData%\ServerPatchTool` с правами только для `SYSTEM` и `Administrators`. Это принципиально: в общедоступном на запись каталоге вроде `%SystemRoot%\Temp` локальный непривилегированный пользователь мог бы подменить скрипт между его записью и запуском от `SYSTEM`, то есть получить выполнение кода с максимальными правами.
+The working directory is `%ProgramData%\ServerPatchTool`, permitted to `SYSTEM` and `Administrators` only. This matters: in a world-writable directory such as `%SystemRoot%\Temp`, an unprivileged local user could swap the script between the moment it is written and the moment `SYSTEM` executes it — a straightforward path to code execution as `SYSTEM`. The ACL is re-asserted on every run, in case the directory was pre-created with looser permissions.
 
-У каждого запуска свой GUID в именах файлов, поэтому две операции над одним сервером не мешают друг другу.
+Every run gets its own GUID in the task and file names, so two operations against the same server cannot read or delete each other's results.
 
-### Долгие установки
+### Long installs
 
-Время ожидания установки задаётся в панели («Limit»), по умолчанию 90 минут: кумулятивные обновления регулярно идут дольше часа. Исчерпание лимита ничего не отменяет — установка на сервере продолжается, а инструмент лишь перестаёт её ждать и помечает сервер статусом `Still installing`. В этом случае задача и её лог **намеренно остаются** на сервере в `%ProgramData%\ServerPatchTool`: удаление задачи не остановило бы идущую установку, а только уничтожило бы единственный след того, что произошло. Файлы старше недели убираются при следующей операции с этим сервером.
+The install time limit is set in the toolbar ("Limit", 30–240 minutes, default 90): cumulative updates routinely run for more than an hour. Running out of time cancels nothing — the install continues on the server, and the tool merely stops waiting and marks the row `Still installing`. In that case the task and its log are **deliberately left behind** in `%ProgramData%\ServerPatchTool`: deleting the task would not stop a running install, only destroy the one record of what happened. Leftovers older than a week are cleaned up during the next operation against that server.
 
-Статус `Still installing` больше не остаётся висеть до ручной проверки: инструмент сам возвращается к такому серверу каждые 10 минут, до шести раз, и запускает сканирование, как только сервер отвечает. Первый же успешный скан заменяет статус на достоверный. Если за час сервер так и не ответил, инструмент прекращает попытки и прямо пишет в журнале, что дальше нужно сканировать вручную. Перепроверки не переживают закрытие окна.
+`Still installing` no longer sits there until somebody scans by hand. The tool comes back to such a server every 10 minutes, up to six times, and scans as soon as the server is free to answer. The first successful scan replaces the status with a real one. If the server has still not answered after an hour, the tool stops trying and says plainly in the log that a manual scan is needed. Re-checks do not survive closing the window.
 
-### Наблюдение за перезагрузкой
+### Watching the reboot
 
-Время наблюдения задаётся в панели («Reboot»), по умолчанию 30 минут. Инструмент не пингует сервер, а подключается по WinRM и сверяет время загрузки ОС со снимком, снятым до перезагрузки, — то есть подтверждает именно факт перезагрузки, а не то, что хост снова начал отвечать. Сервер, применяющий кумулятивное обновление при загрузке, может не уложиться в 30 минут: для таких лимит стоит поднять, иначе наблюдение прекратится со статусом `Offline` или `Partially Online`.
+The watch limit is set in the toolbar too ("Reboot", 15–120 minutes, default 30). The tool does not ping. It connects over WinRM and compares the OS boot time against a snapshot taken before the restart — so "back online" means the machine really rebooted, not merely that the host started answering again. A server applying a cumulative update while booting can exceed 30 minutes; raise the limit for those, or the watch ends with `Offline` or `Partially Online`.
 
-Если наблюдение сорвалось само (задача монитора ничего не вернула или упала), сервер **не** объявляется сломанным: ни то, ни другое ничего не говорит о его состоянии. Вместо этого запускается сканирование, которое и устанавливает правду, а причина срыва пишется в журнал.
+If the watch itself falls over (the monitor job returned nothing, or threw), the server is **not** declared broken: neither outcome says anything about the server's state. A scan is started instead, which does establish the truth, and the reason the watch failed is written to the log.
 
-### Как читать статус после установки
+### Reading the status after an install
 
-Установка сообщает результат по каждому KB отдельно. Если часть обновлений не встала, сервер получает статус `Completed with errors`, а не установившиеся KB остаются в счётчике `Available` и перечисляются в `Details` и в журнале. После установки инструмент сам запускает повторное сканирование и заменяет отчёт установщика проверенным состоянием сервера; если требуется перезагрузка, сканирование выполняется после неё.
+Results are reported per KB. If some updates did not install, the server gets the status `Completed with errors`, and the updates that failed stay in the `Available` count and are listed in `Details` and in the log. After an install the tool runs a confirming scan and replaces the installer's own account of events with the server's verified state; when a reboot is required, that scan happens after it.
 
-Не установившиеся обновления перечисляются с кодом отказа от агента обновлений: `KB5120238 (0x800F0922 - installer failed - often space on the system partition)`. Это `HRESULT`, а не `ResultCode` — последний всегда означает лишь «Failed» и ничего не объясняет. Для шести самых частых кодов рядом выводится короткая подсказка, для остальных — сам код, по которому можно искать. Если агент кода не вернул (например, установка была прервана), выводится `result code N`, а не вводящий в заблуждение `0x00000000`.
+Updates that failed carry the update agent's failure code:
 
-Колонка `Installed` относится только к последнему прогону установки: она очищается в момент старта и заполняется лишь при успешном завершении. После провалившейся установки в ней не остаётся числа от прошлого раза. Сканирование её не меняет — это отметка о выполненной установке, а не текущее состояние сервера, и она переживает перезапуск инструмента.
+```
+KB5120238 (0x800F0922 - installer failed - often space on the system partition)
+```
 
-## Где лежат данные
+That is the `HRESULT`, not the `ResultCode` — the latter only ever says "Failed" and explains nothing. Six of the most common codes get a short hint alongside them; the rest show the code itself, which is enough to search on. If the agent returned no code at all (an aborted install, for instance), the row shows `result code N` rather than a misleading `0x00000000`.
 
-| Что | Где | Примечание |
+The `Installed` column refers only to the most recent install run: it is cleared when one starts and filled in only when one succeeds, so a failed install leaves no stale number behind. Scanning does not change it — it is a record that an install happened, not the server's current state, and it survives a restart of the tool.
+
+## Where data lives
+
+| What | Where | Note |
 |---|---|---|
-| Список серверов и результаты | `servers.json` рядом со скриптом | В `.gitignore` — содержит имена хостов |
-| Журнал работы | `logs/ServerPatchTool_ГГГГММДД.log` | По файлу на день |
-| Учётные данные | `%LOCALAPPDATA%\ServerPatchTool\credentials.json` | Только при включённой галочке «Remember» |
+| Server list and results | `servers.json` next to the script | Gitignored — contains host names |
+| Tool log | `logs/ServerPatchTool_YYYYMMDD.log` | One file per day |
+| Credentials | `%LOCALAPPDATA%\ServerPatchTool\credentials.json` | Only with "Remember" ticked |
 
-Формат `servers.json`:
+`servers.json` format:
 
 ```json
 [
   {
     "Name": "SRV-EXAMPLE-01",
-    "Credential": "EXAMPLE\\svc-patch",
+    "Credential": "EXAMPLE\svc-patch",
     "Selected": true,
     "Status": "Available (3)",
     "Available": "3",
     "Installed": "0",
     "RebootRequired": "No",
     "LastScan": "2026-08-11 02:15",
-    "Details": "KB0000000: пример",
+    "Details": "KB0000000: example",
     "UpdateList": []
   }
 ]
 ```
 
-## О хранении учётных данных
+## About stored credentials
 
-Сохранение пароля — **по желанию**, галочкой «Remember». Пароль шифруется механизмом Windows DPAPI под текущей учётной записью: файл бесполезен для другого пользователя и на другой машине.
+Saving the password is **optional**, via the "Remember" checkbox. It is encrypted with Windows DPAPI under the current user account: the file is worthless to any other Windows account and on any other machine.
 
-**Чего это не даёт:** защиты от того, кто уже работает под этой же учётной записью на этом же компьютере — любой код, запущенный от вашего имени, сможет расшифровать пароль. Для учётной записи с правами администратора домена это означает, что её безопасность равна безопасности рабочей станции.
+**What that does not give you:** protection from anyone already running as this account on this machine — any code running as you can decrypt it. For an account with domain administrator rights, that means its security is only as good as the security of the workstation.
 
-Снятие галочки удаляет файл немедленно, а не при выходе.
+Unticking the box deletes the file immediately, not on exit. Removing a credential rewrites the file, so a deleted account does not reappear on the next launch — including when it was the last one, in which case the file is removed rather than written empty.
 
-## Проверка перед изменениями
+## Checks before changing anything
 
 ```bash
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File _validate.ps1
 ```
 
-Скрипт разбирает основной файл парсером PowerShell, загружает разметку XAML, сверяет, что все именованные элементы резолвятся, и отдельно разбирает код, который уезжает на серверы. Последнее важно: payload-ы лежат внутри here-string, обычный разбор файла в них не заглядывает, и ошибка синтаксиса там вылезла бы только на живом сервере посреди окна обслуживания.
-
-Поведенческие тесты:
+Parses the main file, loads the XAML markup, checks that every named control resolves, and separately parses the code that is shipped out to the servers. That last part matters: the payloads live inside here-strings, so parsing the file does not look into them, and a syntax error there would surface only on a live server, halfway through a maintenance window.
 
 ```bash
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File _tests.ps1
 ```
 
-Основной файл целиком подключить нельзя — при загрузке он строит окно. Поэтому тесты находят нужный кусок в реальном файле парсером и выполняют его отдельно, на заглушках: так проверяется поставляемый код, а не его копия, и тест падает, если код переименовали или перенесли. Покрыты таймер завершения задач, отчёт об установке, выбор и удаление учётных записей, обработчик монитора перезагрузки, очереди последовательного режима, отложенные перепроверки и оба лимита времени. Живые серверы и окно не нужны.
+Behavioural tests — 146 checks, no live server and no window required. The tool is a single file that builds a window as it loads, so it cannot simply be dot-sourced; instead each unit under test is located in the real file with the PowerShell parser and evaluated on its own against stubs. That way the shipped code is exercised rather than a copy of it, and a test fails loudly if the code it targets is renamed or moved.
+
+Covered: the job completion timer, install reporting, credential selection and removal, the post-reboot monitor and how it is launched, the sequential queues, deferred re-checks, and both time limits.
 
 > [!IMPORTANT]
-> Файлы `.ps1` хранятся **без BOM**, поэтому PowerShell 5.1 читает их в системной однобайтовой кодировке. Код и строки должны оставаться в ASCII: кириллица в коде приведёт к ошибкам разбора. Валидатор об этом предупреждает.
+> `.ps1` files are stored **without a BOM**, so PowerShell 5.1 reads them in the system's single-byte code page. Code and strings must stay ASCII. The validator checks this.
 
-## Что осталось сделать
+## A note on PowerShell closures
 
-- Обкатка сценариев, не покрытых проверкой на живом сервере (см. предупреждение вверху)
-- Разделение файла на модули с вынесением XAML в отдельный файл
-- Замена обновления таблицы через `RemoveAt`/`Insert` на `INotifyPropertyChanged` — сейчас строка при обновлении пересоздаётся, из-за чего таблица мигает
-- `Get-StatusColor` — мёртвый код: функция раскраски статусов определена, но нигде не вызывается. Либо доделать раскраску строк, либо удалить
-- Автотесты: базовые есть в `_tests.ps1`; не покрыты обработчики UI-событий — их логику сначала нужно вынести в функции
+This cost the project two production failures, so it is worth writing down.
 
-## Лицензия
+Every completion callback here is a closure created with `.GetNewClosure()`, and a closure is bound to a module of its own. It can see only the local variables that were copied into it at the moment it was created. Three consequences:
 
-MIT — см. [LICENSE](LICENSE).
+- A `$script:` variable **read** inside a closure comes out empty.
+- An assignment to a `$script:` variable inside a closure sets a copy, and never reaches the variable everyone else reads.
+- A closure created **inside another closure** captures nothing at all.
+
+Method calls still work — `$queue.Dequeue()` mutates the real object — which is exactly why this hides so well: half of the code appears to behave.
+
+Anything a callback needs to do therefore belongs in a named function. Function bodies run in the script's own session state, so their reads and writes land where they are expected. `Step-SequentialInstallQueue`, `Step-RebootQueue`, `Start-RebootMonitor` and `Complete-ADImport` all exist for this reason, and `_tests.ps1` guards each of them.
+
+## Known limitations
+
+- **No per-server locking.** Nothing stops a scan from being started against a server that is currently installing. Task and file names are unique per run, so nothing is corrupted; the update agent serialises the work and the second operation fails with a confusing error.
+- **Nothing survives closing the window.** In-flight monitoring, sequential queues and deferred re-checks are all lost. Work already handed to a server carries on there regardless.
+- **One file, including the XAML.** Splitting it up would make more of it testable.
+- The grid rebuilds rows through `RemoveAt`/`Insert` rather than `INotifyPropertyChanged`, so it flickers on update.
+- `Get-StatusColor` is dead code: defined, never called.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

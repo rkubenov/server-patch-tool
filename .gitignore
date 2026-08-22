@@ -1,14 +1,14 @@
-# Локальный список серверов (содержит имена хостов инфраструктуры)
+# Local server list (contains infrastructure host names)
 servers.json
 
-# Журналы работы инструмента
+# Tool logs
 logs/
 *.log
 
-# Временные файлы
+# Temporary files
 *.tmp
 *~
 ~$*
 
-# Локальные настройки Claude Code
+# Local Claude Code settings
 .claude/settings.local.json
