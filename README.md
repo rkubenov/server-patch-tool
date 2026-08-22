@@ -3,7 +3,7 @@
 A PowerShell + WPF desktop tool for driving Windows Updates across domain-joined servers: scan for missing updates, install them, reboot, and confirm the result — all from one grid.
 
 > [!NOTE]
-> **Field status.** Scanning, installing across a batch of servers (including a cumulative update that failed on one of them), rebooting, confirming the server really came back, and the follow-up scan have all been exercised against live servers during maintenance windows. Importing from Active Directory and the deferred re-checks that follow an install time-out have not been exercised in the field yet.
+> **Field status.** In use against test and production servers: scan, install, reboot, and the confirming scan afterwards. That includes a cumulative update that failed on one server while the rest of the batch installed cleanly, and sequential batches where each reboot waited for the previous server to come back before the next one was touched.
 
 ## What it does
 
@@ -50,6 +50,8 @@ The install time limit is set in the toolbar ("Limit", 30–240 minutes, default
 The watch limit is set in the toolbar too ("Reboot", 15–120 minutes, default 30). The tool does not ping. It connects over WinRM and compares the OS boot time against a snapshot taken before the restart — so "back online" means the machine really rebooted, not merely that the host started answering again. A server applying a cumulative update while booting can exceed 30 minutes; raise the limit for those, or the watch ends with `Offline` or `Partially Online`.
 
 If the watch itself falls over (the monitor job returned nothing, or threw), the server is **not** declared broken: neither outcome says anything about the server's state. A scan is started instead, which does establish the truth, and the reason the watch failed is written to the log.
+
+In sequential mode the queue waits on this: the next server is not rebooted until the previous one's watch has finished, whether it ended by the server coming back, by the limit expiring, or by the watch failing. A server that never returns delays the queue by the watch limit; it does not stall it.
 
 ### Reading the status after an install
 
@@ -140,6 +142,7 @@ Anything a callback needs to do therefore belongs in a named function. Function 
 - **One file, including the XAML.** Splitting it up would make more of it testable.
 - The grid rebuilds rows through `RemoveAt`/`Insert` rather than `INotifyPropertyChanged`, so it flickers on update.
 - `Get-StatusColor` is dead code: defined, never called.
+- **Two paths have not come up in practice yet:** importing from Active Directory, and the deferred re-checks that follow an install time-out. Both are covered by the tests; neither has been exercised against a live server.
 
 ## License
 
