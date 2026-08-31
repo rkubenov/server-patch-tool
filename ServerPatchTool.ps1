@@ -285,6 +285,8 @@ if (-not (Test-Path -LiteralPath $script:LogDir)) {
                             ToolTip="Add a new credential set (domain\username)"/>
                     <Button x:Name="btnManageCredentials" Content="Manage" FontSize="12"
                             ToolTip="View and remove saved credentials"/>
+                    <Button x:Name="btnChangePassword" Content="Change Password" FontSize="12"
+                            ToolTip="Replace the password stored for a saved credential"/>
                 </StackPanel>
             </Grid>
         </Border>
@@ -811,6 +813,33 @@ function Remove-CredentialSet {
     Save-Credentials
     Save-ServerList
     Write-Log "Removed credential: $Label"
+    return $true
+}
+
+# Replaces the password on an existing credential set. The label is deliberately
+# left alone: it is the key every server entry stores, so changing it here would
+# strand each of them on an account that no longer exists. Kept out of the
+# button's handler so it can be exercised without opening a dialog.
+function Set-CredentialPassword {
+    param(
+        [string]$Label,
+        [System.Security.SecureString]$Password
+    )
+
+    if (-not $Label -or -not $script:Credentials.ContainsKey($Label)) { return $false }
+    # An empty password would be stored and then fail every logon with nothing
+    # in the log to explain it, so refuse it instead of writing it out.
+    if (-not $Password -or $Password.Length -eq 0) { return $false }
+
+    # PSCredential.Password is read-only, so the set is replaced rather than
+    # edited in place. The label is reused as the username on purpose.
+    $script:Credentials[$Label] =
+        New-Object System.Management.Automation.PSCredential($Label, $Password)
+
+    # Same reason as Remove-CredentialSet: without this the new password lives
+    # only in memory and the next launch reads the old one back off disk.
+    Save-Credentials
+    Write-Log "Changed password for credential: $Label"
     return $true
 }
 
@@ -2407,6 +2436,47 @@ $ui.btnManageCredentials.Add_Click({
         $toRemove = ""
     }
     Remove-CredentialSet -Label $toRemove | Out-Null
+})
+
+# Change the password on an existing credential
+$ui.btnChangePassword.Add_Click({
+    if ($script:Credentials.Count -eq 0) {
+        [System.Windows.MessageBox]::Show("No credentials added yet.", "Change Password", "OK", "Information")
+        return
+    }
+
+    $credList = @($script:Credentials.Keys)
+    if ($credList.Count -eq 1) {
+        $label = $credList[0]
+    } else {
+        $options = for ($i = 0; $i -lt $credList.Count; $i++) { "$($i+1). $($credList[$i])" }
+        $msg = "Change the password of which credential?`n`n$($options -join "`n")`n`nEnter the number:"
+        try {
+            $choice = [Microsoft.VisualBasic.Interaction]::InputBox($msg, "Change Password", "1")
+        } catch {
+            $choice = ""
+        }
+        if (-not $choice) { return }
+        $idx = 0
+        if ([int]::TryParse($choice, [ref]$idx) -and $idx -ge 1 -and $idx -le $credList.Count) {
+            $label = $credList[$idx - 1]
+        } else {
+            [System.Windows.MessageBox]::Show("That is not one of the listed numbers.", "Change Password", "OK", "Warning")
+            return
+        }
+    }
+
+    # The username box comes pre-filled but stays editable. Only the password is
+    # taken from it: the label is what every server entry stores, so renaming an
+    # account here would strand all of them. That is Add Credential plus Manage.
+    $cred = Get-Credential -UserName $label -Message "Enter the new password for $label"
+    if (-not $cred) { return }
+    if ($cred.UserName -ne $label) {
+        Write-Log "Username edited in the password prompt - only the password of $label was changed" "WARN"
+    }
+    if (-not (Set-CredentialPassword -Label $label -Password $cred.Password)) {
+        [System.Windows.MessageBox]::Show("The password was not changed - it must not be empty.", "Change Password", "OK", "Warning")
+    }
 })
 
 # Context menu handlers

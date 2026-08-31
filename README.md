@@ -11,7 +11,7 @@ A PowerShell + WPF desktop tool for driving Windows Updates across domain-joined
 - Install updates in parallel, or one server at a time
 - Reboot with confirmation that the server actually came back
 - Import the server list from a file or from Active Directory
-- Several credential sets, for different domains, bound to individual servers
+- Several credential sets, for different domains, bound to individual servers, with in-place password changes
 - Export results to CSV
 
 ## Requirements
@@ -102,6 +102,8 @@ Saving the password is **optional**, via the "Remember" checkbox. It is encrypte
 
 Unticking the box deletes the file immediately, not on exit. Removing a credential rewrites the file, so a deleted account does not reappear on the next launch — including when it was the last one, in which case the file is removed rather than written empty.
 
+A rotated domain password is changed in place with the "Change Password" button: the stored username stays exactly as it was, so every server already bound to that account keeps working, and the new password is written to the file straight away rather than only living until the tool is closed.
+
 ## Checks before changing anything
 
 ```bash
@@ -114,9 +116,9 @@ Parses the main file, loads the XAML markup, checks that every named control res
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File _tests.ps1
 ```
 
-Behavioural tests — 146 checks, no live server and no window required. The tool is a single file that builds a window as it loads, so it cannot simply be dot-sourced; instead each unit under test is located in the real file with the PowerShell parser and evaluated on its own against stubs. That way the shipped code is exercised rather than a copy of it, and a test fails loudly if the code it targets is renamed or moved.
+Behavioural tests — 159 checks, no live server and no window required. The tool is a single file that builds a window as it loads, so it cannot simply be dot-sourced; instead each unit under test is located in the real file with the PowerShell parser and evaluated on its own against stubs. That way the shipped code is exercised rather than a copy of it, and a test fails loudly if the code it targets is renamed or moved.
 
-Covered: the job completion timer, install reporting, credential selection and removal, the post-reboot monitor and how it is launched, the sequential queues, deferred re-checks, and both time limits.
+Covered: the job completion timer, install reporting, credential selection, removal and password changes, the post-reboot monitor and how it is launched, the sequential queues, deferred re-checks, and both time limits.
 
 > [!IMPORTANT]
 > `.ps1` files are stored **without a BOM**, so PowerShell 5.1 reads them in the system's single-byte code page. Code and strings must stay ASCII. The validator checks this.
