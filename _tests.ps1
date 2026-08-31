@@ -21,17 +21,19 @@
                                  substituted silently.
       4. Credential removal    - a deleted account must not come back after a
                                  restart, including the last one.
-      5. Post-reboot monitor   - losing the monitor must not be reported as a
+      5. Credential password   - a rotated password must reach disk, and must
+                                 not move the label the servers point at.
+      6. Post-reboot monitor   - losing the monitor must not be reported as a
                                  broken server, and never without a reason.
-      6. Monitor launch        - the watch must be handed a real script block
+      7. Monitor launch        - the watch must be handed a real script block
                                  and a server name, neither of which survives
                                  being started from inside a closure.
-      7. AD import             - found servers must reach the grid, once each.
-      8. Sequential queues     - the "run in progress" flags must be cleared
+      8. AD import             - found servers must reach the grid, once each.
+      9. Sequential queues     - the "run in progress" flags must be cleared
                                  when the queue drains, closures included.
-      9. Deferred re-checks    - a server the tool stopped watching must be
+     10. Deferred re-checks    - a server the tool stopped watching must be
                                  asked again, and eventually given up on.
-     10. Time limits           - the install and reboot settings are read,
+     11. Time limits           - the install and reboot settings are read,
                                  with sane fallbacks.
 
     Not covered: anything that talks to a live server, and the UI event
@@ -438,6 +440,47 @@ Reset-CredentialFixture
 $before = $script:Credentials.Count
 Check "the call reports it did nothing"        ((Remove-CredentialSet -Label 'DOM9\nobody') -eq $false)
 Check "no credential was dropped"              ($script:Credentials.Count -eq $before)
+
+# =============================================================================
+Section "Credential password change survives a restart"
+# A rotated domain password has to reach credentials.json, or the next launch
+# reads the old one back and every logon fails for a reason nothing explains.
+# The label must stay put while that happens: it is the key each server entry
+# stores, so moving it would strand every server that referred to the account.
+# =============================================================================
+Invoke-Expression (Get-FunctionText -Name 'Set-CredentialPassword')
+
+function Get-PlainPassword { param($Credential) $Credential.GetNetworkCredential().Password }
+
+Case "a new password is kept for the next launch"
+Reset-CredentialFixture
+$rotated = ConvertTo-SecureString 'rotated-not-a-secret' -AsPlainText -Force
+Check "the change reports success"             ((Set-CredentialPassword -Label 'DOM1\user-a' -Password $rotated) -eq $true)
+Check "memory holds the new password"          ((Get-PlainPassword $script:Credentials['DOM1\user-a']) -eq 'rotated-not-a-secret')
+Invoke-Restart
+Check "and so does disk after a restart"       ((Get-PlainPassword $script:Credentials['DOM1\user-a']) -eq 'rotated-not-a-secret')
+Check "the other account was left alone"       ((Get-PlainPassword $script:Credentials['DOM2\user-b']) -eq 'placeholder-not-a-secret')
+
+Case "the label a server points at does not move"
+Reset-CredentialFixture
+Set-CredentialPassword -Label 'DOM2\user-b' -Password $rotated | Out-Null
+Check "the key is unchanged"                   ($script:Credentials.ContainsKey('DOM2\user-b'))
+Check "the username is unchanged"              ($script:Credentials['DOM2\user-b'].UserName -eq 'DOM2\user-b')
+Check "the server still points at it"          ($script:ServerData[0].CredentialLabel -eq 'DOM2\user-b')
+Check "the default was not disturbed"          ($script:DefaultCredentialLabel -eq 'DOM1\user-a')
+
+Case "an account that is not there gains no password"
+Reset-CredentialFixture
+Check "the call reports it did nothing"        ((Set-CredentialPassword -Label 'DOM9\nobody' -Password $rotated) -eq $false)
+Check "no account was invented"                ($script:Credentials.Count -eq 2)
+
+Case "an empty password is refused rather than stored"
+Reset-CredentialFixture
+$empty = New-Object System.Security.SecureString
+Check "the call reports it did nothing"        ((Set-CredentialPassword -Label 'DOM1\user-a' -Password $empty) -eq $false)
+Check "the working password survived"          ((Get-PlainPassword $script:Credentials['DOM1\user-a']) -eq 'placeholder-not-a-secret')
+Invoke-Restart
+Check "and is still there after a restart"     ((Get-PlainPassword $script:Credentials['DOM1\user-a']) -eq 'placeholder-not-a-secret')
 
 if (Test-Path -LiteralPath $script:CredDir) {
     Remove-Item -LiteralPath $script:CredDir -Recurse -Force -ErrorAction SilentlyContinue
