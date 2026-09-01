@@ -23,17 +23,22 @@
                                  restart, including the last one.
       5. Credential password   - a rotated password must reach disk, and must
                                  not move the label the servers point at.
-      6. Post-reboot monitor   - losing the monitor must not be reported as a
+      6. Password guard        - repeated rejected logons must stop the run
+                                 before the domain lockout policy does, and a
+                                 server that is merely down must not count.
+      7. Credential test       - the probe must say which of the two things
+                                 went wrong, and must not arm the guard.
+      8. Post-reboot monitor   - losing the monitor must not be reported as a
                                  broken server, and never without a reason.
-      7. Monitor launch        - the watch must be handed a real script block
+      9. Monitor launch        - the watch must be handed a real script block
                                  and a server name, neither of which survives
                                  being started from inside a closure.
-      8. AD import             - found servers must reach the grid, once each.
-      9. Sequential queues     - the "run in progress" flags must be cleared
+     10. AD import             - found servers must reach the grid, once each.
+     11. Sequential queues     - the "run in progress" flags must be cleared
                                  when the queue drains, closures included.
-     10. Deferred re-checks    - a server the tool stopped watching must be
+     12. Deferred re-checks    - a server the tool stopped watching must be
                                  asked again, and eventually given up on.
-     11. Time limits           - the install and reboot settings are read,
+     13. Time limits           - the install and reboot settings are read,
                                  with sane fallbacks.
 
     Not covered: anything that talks to a live server, and the UI event
@@ -121,6 +126,11 @@ Invoke-Expression (Get-AssignmentText -VariablePath '$script:RecheckInterval')
 Invoke-Expression (Get-AssignmentText -VariablePath '$script:RecheckAttempts')
 function Add-PendingRecheck   { param([string]$ServerName) }
 function Step-PendingRechecks { }
+# The tick reports every job's outcome to the stale-password guard and gives it
+# a chance to tear the run down. The guard has a section of its own further
+# down; here it only has to exist, so the tick can be tested on its own terms.
+function Register-JobAuthOutcome { param($Result) }
+function Step-AuthLockdown { }
 
 function Get-LoggedLike { param([string]$Pattern) @($script:Logged | Where-Object { $_ -like $Pattern }) }
 
@@ -485,6 +495,149 @@ Check "and is still there after a restart"     ((Get-PlainPassword $script:Crede
 if (Test-Path -LiteralPath $script:CredDir) {
     Remove-Item -LiteralPath $script:CredDir -Recurse -Force -ErrorAction SilentlyContinue
 }
+
+
+# =============================================================================
+Section "Stale-password guard"
+# A password rotated in the domain but not here is fired at every server in the
+# batch at once. Each rejection is a bad logon against the same account, so a
+# large batch can walk into the domain lockout policy and lock the account the
+# maintenance window depends on. The guard has to stop the run before that -
+# and just as importantly, must not stop it for a server that is merely down.
+# =============================================================================
+Invoke-Expression (Get-AssignmentText -VariablePath '$script:AuthFailureLimit')
+Invoke-Expression (Get-FunctionText   -Name 'Test-AuthFailure')
+Invoke-Expression (Get-FunctionText   -Name 'Test-AccountLockedOut')
+Invoke-Expression (Get-FunctionText   -Name 'Register-JobAuthOutcome')
+Invoke-Expression (Get-FunctionText   -Name 'Step-AuthLockdown')
+Invoke-Expression (Get-FunctionText   -Name 'Complete-CredentialTest')
+Invoke-Expression (Get-FunctionText   -Name 'Invoke-CredentialTest')
+
+$script:Stopped = @()
+$script:Notices = @()
+function Stop-AllOperations { param([string]$Reason = "Stopped by user") $script:Stopped += $Reason }
+function Show-AuthHaltNotice { param([string]$Text, [string]$Title = "notice") $script:Notices += "$Title|$Text" }
+$script:StartedJobs = @()
+function Start-AsyncJob { param($ScriptBlock, $Arguments, $OnComplete) $script:StartedJobs += ,$Arguments }
+
+function Reset-Guard {
+    $script:AuthFailures    = 0
+    $script:AuthHaltPending = $false
+    $script:AuthHaltReason  = ""
+    $script:Stopped = @(); $script:Notices = @(); $script:Logged = @()
+}
+function New-JobResult {
+    param([bool]$Success, [string]$ErrorText = "", [switch]$Probe)
+    $o = [PSCustomObject]@{ Success = $Success; Error = $ErrorText }
+    if ($Probe) { $o | Add-Member NoteProperty Probe $true }
+    $o
+}
+
+Case "a rejected logon is told apart from a server that is simply not there"
+Check "a bad password is a rejection"          (Test-AuthFailure -ErrorText 'Logon failure: unknown user name or bad password.')
+Check "access denied is a rejection"           (Test-AuthFailure -ErrorText 'Connecting to remote server failed: Access is denied.')
+Check "an expired password is a rejection"     (Test-AuthFailure -ErrorText 'The password has expired.')
+Check "a locked account is a rejection"        (Test-AuthFailure -ErrorText 'The referenced account is currently locked out.')
+Check "an unresolvable name is not"            (-not (Test-AuthFailure -ErrorText 'the server name cannot be resolved'))
+Check "a refused connection is not"            (-not (Test-AuthFailure -ErrorText 'The client cannot connect to the destination specified in the request'))
+Check "no error text at all is not"            (-not (Test-AuthFailure -ErrorText ''))
+Check "a lock is recognised on its own"        (Test-AccountLockedOut -ErrorText 'The referenced account is currently locked out.')
+Check "a bad password alone is not a lock"     (-not (Test-AccountLockedOut -ErrorText 'The user name or password is incorrect.'))
+
+Case "rejections add up until the run is halted"
+Reset-Guard
+Register-JobAuthOutcome -Result (New-JobResult -Success $false -ErrorText 'Access is denied.')
+Check "one rejection is not enough"            (-not $script:AuthHaltPending)
+Check "but it was counted"                     ($script:AuthFailures -eq 1)
+Register-JobAuthOutcome -Result (New-JobResult -Success $false -ErrorText 'Access is denied.')
+Check "reaching the limit arms the halt"       ($script:AuthHaltPending)
+Check "the reason quotes the count"            ($script:AuthHaltReason -match "$($script:AuthFailureLimit) logons")
+
+Case "a server that answers proves the password and clears the count"
+Reset-Guard
+Register-JobAuthOutcome -Result (New-JobResult -Success $false -ErrorText 'Access is denied.')
+Register-JobAuthOutcome -Result (New-JobResult -Success $true)
+Check "the count went back to zero"            ($script:AuthFailures -eq 0)
+Register-JobAuthOutcome -Result (New-JobResult -Success $false -ErrorText 'Access is denied.')
+Check "so the next rejection does not halt"    (-not $script:AuthHaltPending)
+
+Case "a server that is merely unreachable costs nothing"
+Reset-Guard
+Register-JobAuthOutcome -Result (New-JobResult -Success $false -ErrorText 'the server name cannot be resolved')
+Register-JobAuthOutcome -Result (New-JobResult -Success $false -ErrorText 'the server name cannot be resolved')
+Check "nothing was counted"                    ($script:AuthFailures -eq 0)
+Check "the run was not halted"                 (-not $script:AuthHaltPending)
+
+Case "an account already locked stops the run at once"
+Reset-Guard
+Register-JobAuthOutcome -Result (New-JobResult -Success $false -ErrorText 'The referenced account is currently locked out.')
+Check "one report is enough"                   ($script:AuthHaltPending)
+Check "the reason says what happened"          ($script:AuthHaltReason -match 'locked out')
+
+Case "a deliberate probe from the Test button never arms the guard"
+Reset-Guard
+Register-JobAuthOutcome -Result (New-JobResult -Success $false -ErrorText 'Access is denied.' -Probe)
+Register-JobAuthOutcome -Result (New-JobResult -Success $false -ErrorText 'Access is denied.' -Probe)
+Check "nothing was counted"                    ($script:AuthFailures -eq 0)
+Check "the run was not halted"                 (-not $script:AuthHaltPending)
+
+Case "the halt tears the run down once, then re-arms"
+Reset-Guard
+$script:AuthHaltPending = $true
+$script:AuthHaltReason  = "2 logons in a row were rejected"
+Check "it reports that it acted"               ((Step-AuthLockdown) -eq $true)
+Check "operations were stopped"                ($script:Stopped.Count -eq 1)
+Check "the halt is not blamed on the user"     ($script:Stopped[0] -notmatch 'by user')
+Check "the operator was told"                  ($script:Notices.Count -eq 1)
+Check "the advice names Change Password"       ($script:Notices[0] -match 'Change Password')
+Check "and names Test"                         ($script:Notices[0] -match 'Test')
+Check "the guard is armed again"               ((-not $script:AuthHaltPending) -and $script:AuthFailures -eq 0)
+Check "a second call does nothing"             ((Step-AuthLockdown) -eq $false)
+Check "and stopped nothing twice"              ($script:Stopped.Count -eq 1)
+
+
+# =============================================================================
+Section "Credential test"
+# Finding out that the stored password is stale by starting a real patch run is
+# how a maintenance window gets lost. The check has to say which of the two
+# things went wrong, because a rejected account and an unreachable server read
+# almost alike in the log but need opposite responses.
+# =============================================================================
+Case "a credential that authenticates says so"
+Reset-Guard
+$ok = Complete-CredentialTest -Label 'DOM1\user-a' -ServerName 'srv-1' -Result ([PSCustomObject]@{ Success = $true; Error = ''; RemoteName = 'SRV-1'; Probe = $true })
+Check "it reports success"                     ($ok -eq $true)
+Check "the answer names the server"            ($script:Notices[0] -match 'SRV-1')
+Check "nothing was logged as an error"         ((Get-LoggedLike 'ERROR|*').Count -eq 0)
+
+Case "a rejected credential points at the password"
+Reset-Guard
+$ok = Complete-CredentialTest -Label 'DOM1\user-a' -ServerName 'srv-1' -Result ([PSCustomObject]@{ Success = $false; Error = 'The user name or password is incorrect.'; RemoteName = ''; Probe = $true })
+Check "it reports failure"                     ($ok -eq $false)
+Check "the advice is Change Password"          ($script:Notices[0] -match 'Change Password')
+Check "the cause is kept verbatim"             ($script:Notices[0] -match 'password is incorrect')
+Check "it is logged as an error"               ((Get-LoggedLike 'ERROR|*').Count -eq 1)
+
+Case "an unreachable server is not blamed on the password"
+Reset-Guard
+$ok = Complete-CredentialTest -Label 'DOM1\user-a' -ServerName 'srv-1' -Result ([PSCustomObject]@{ Success = $false; Error = 'The client cannot connect to the destination specified in the request'; RemoteName = ''; Probe = $true })
+Check "it reports failure"                     ($ok -eq $false)
+Check "no one is sent to change a password"    ($script:Notices[0] -notmatch 'Change Password')
+Check "it says the server was unreachable"     ($script:Notices[0] -match 'could not be reached')
+
+Case "a test with nothing to test starts no logon"
+$script:Credentials = @{ 'DOM1\user-a' = (New-TestCredential 'DOM1\user-a') }
+$script:StartedJobs = @()
+Check "an unknown account starts nothing"      ((Invoke-CredentialTest -Label 'DOM9\nobody' -ServerName 'srv-1') -eq $false)
+Check "an empty server starts nothing"         ((Invoke-CredentialTest -Label 'DOM1\user-a' -ServerName '') -eq $false)
+Check "no logon was spent"                     ($script:StartedJobs.Count -eq 0)
+
+Case "the test sends the chosen account to the chosen server"
+$script:StartedJobs = @()
+Check "it reports that it started"             ((Invoke-CredentialTest -Label 'DOM1\user-a' -ServerName 'srv-1') -eq $true)
+Check "exactly one logon was started"          ($script:StartedJobs.Count -eq 1)
+Check "against the server it was given"        ($script:StartedJobs[0][0] -eq 'srv-1')
+Check "with the credential that was picked"    ($script:StartedJobs[0][1].UserName -eq 'DOM1\user-a')
 
 
 # =============================================================================
