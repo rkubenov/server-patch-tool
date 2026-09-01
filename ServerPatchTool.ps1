@@ -369,6 +369,8 @@ if (-not (Test-Path -LiteralPath $script:LogDir)) {
                         <ComboBoxItem Content="90 min"/>
                         <ComboBoxItem Content="120 min"/>
                     </ComboBox>
+                    <Button x:Name="btnHeldBackKB" Content="Held-back KBs" FontSize="12" Margin="10,0,0,0"
+                            ToolTip="Updates to skip on every install - for a cumulative that is known to fail here, or one waiting on a vendor fix"/>
                     <Border Width="1" Background="#45475a" Margin="8,2"/>
                     <Button x:Name="btnScanSelected" Content="Scan Selected" Style="{StaticResource AccentButton}"
                             ToolTip="Check for updates on checked servers only"/>
@@ -1191,18 +1193,44 @@ try {
     $searchResult  = $searcher.Search("IsInstalled=0 AND IsHidden=0")
     Log "Found $($searchResult.Updates.Count) update(s)"
 
-    if ($searchResult.Updates.Count -eq 0) {
+    # Updates the operator has chosen to hold back. $ExcludedKB arrives as a
+    # plain assignment prepended by the caller; an empty list holds nothing back.
+    if (-not $ExcludedKB) { $ExcludedKB = @() }
+    $pending = @()
+    $held    = @()
+    foreach ($u in $searchResult.Updates) {
+        $hit = @(@($u.KBArticleIDs) | Where-Object { $ExcludedKB -contains "$_" })
+        if ($hit.Count -gt 0) {
+            $held += "KB$($hit[0])"
+            Log "Held back KB$($hit[0]) - on the exclusion list: $($u.Title)"
+        } else {
+            $pending += $u
+        }
+    }
+    if ($held.Count -gt 0) {
+        Log "Holding back $($held.Count) update(s): $($held -join ', ')"
+    }
+
+    if ($pending.Count -eq 0) {
+        # "Nothing was pending" and "everything pending was held back" are
+        # different answers, and only the first means the server is up to date.
+        $noneMsg = if ($held.Count -gt 0) {
+            "All $($held.Count) available update(s) are on the held-back list"
+        } else {
+            "No updates to install"
+        }
         $result = @{
             Success        = $true
             InstalledCount = 0
             FailedCount    = 0
             RebootRequired = $false
             Error          = $null
-            Message        = "No updates to install"
+            HeldBack       = $held
+            Message        = $noneMsg
         }
     } else {
         # Accept EULAs - required before download/install
-        foreach ($u in $searchResult.Updates) {
+        foreach ($u in $pending) {
             if (-not $u.EulaAccepted) {
                 $u.AcceptEula()
                 Log "Accepted EULA: $($u.Title)"
@@ -1211,7 +1239,7 @@ try {
 
         # Download
         $toDownload = New-Object -ComObject Microsoft.Update.UpdateColl
-        foreach ($u in $searchResult.Updates) {
+        foreach ($u in $pending) {
             if (-not $u.IsDownloaded) { $toDownload.Add($u) | Out-Null }
         }
         if ($toDownload.Count -gt 0) {
@@ -1226,7 +1254,7 @@ try {
 
         # Install
         $toInstall = New-Object -ComObject Microsoft.Update.UpdateColl
-        foreach ($u in $searchResult.Updates) {
+        foreach ($u in $pending) {
             if ($u.IsDownloaded) { $toInstall.Add($u) | Out-Null }
         }
 
@@ -1306,6 +1334,7 @@ try {
                 FailedTitles    = $failList
                 RebootRequired  = $sysInfo.RebootRequired
                 Error           = $err
+                HeldBack        = $held
                 Message         = $msg
             }
         }
@@ -1483,6 +1512,97 @@ $script:ScanTimeout = 600    # 10 min
 # toolbar, defaults to 90 minutes, and running out of it no longer destroys the
 # evidence - see the timeout branch of $RunAsSystemScript.
 $script:InstallTimeoutDefault = 5400   # 90 min
+
+# -- Held-back updates --------------------------------------------------------
+# One bad cumulative can fail on every server in the estate, and until the
+# vendor fixes it the only way through the window was to let it fail again each
+# time. Listing its KB here takes it out of every install until it is removed.
+$script:ExcludedKBFile = Join-Path $script:CredDir "excluded-kb.json"
+$script:ExcludedKB     = @()
+
+# Accepts whatever the operator types - "KB5120238, 5034441 kb5000802" - and
+# reduces it to bare numbers, because bare numbers are what the update agent
+# reports back in KBArticleIDs.
+function ConvertTo-KBNumbers {
+    param([string]$Text)
+    if (-not $Text) { return @() }
+    $out = New-Object System.Collections.Generic.List[string]
+    foreach ($token in ($Text -split '[^0-9A-Za-z]+')) {
+        if (-not $token) { continue }
+        $number = $token -replace '^[Kk][Bb]', ''
+        # Anything that is not a KB number is dropped rather than passed on: it
+        # would travel to every server and match nothing, which looks identical
+        # to a working exclusion right up to the moment the update installs.
+        if ($number -match '^\d+$' -and -not $out.Contains($number)) {
+            $out.Add($number) | Out-Null
+        }
+    }
+    # The leading comma matters. Returning a one-element array unrolls it into a
+    # bare string, and a caller indexing [0] then gets the character "5" rather
+    # than the KB number - which reads as a working exclusion right up to the
+    # point where the update installs anyway.
+    return ,@($out)
+}
+
+function Save-ExcludedKB {
+    try {
+        if ($script:ExcludedKB.Count -eq 0) {
+            if (Test-Path -LiteralPath $script:ExcludedKBFile) {
+                Remove-Item -LiteralPath $script:ExcludedKBFile -Force -ErrorAction SilentlyContinue
+            }
+            return
+        }
+        if (-not (Test-Path -LiteralPath $script:CredDir)) {
+            New-Item -ItemType Directory -Path $script:CredDir -Force | Out-Null
+        }
+        # Always an array: a single held-back KB round-trips through ConvertTo-Json
+        # as a bare string, and the next load would then hold back each of its
+        # digits instead.
+        ConvertTo-Json @($script:ExcludedKB) -Depth 2 |
+            Set-Content -Path $script:ExcludedKBFile -Encoding UTF8 -Force
+    } catch {
+        Write-Log "Could not save the held-back KB list: $($_.Exception.Message)" "WARN"
+    }
+}
+
+function Load-ExcludedKB {
+    if (-not (Test-Path -LiteralPath $script:ExcludedKBFile)) { return @() }
+    try {
+        $raw = Get-Content -LiteralPath $script:ExcludedKBFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        $script:ExcludedKB = ConvertTo-KBNumbers -Text (@($raw) -join ' ')
+    } catch {
+        Write-Log "The held-back KB list could not be read - starting with none" "WARN"
+        $script:ExcludedKB = @()
+    }
+    if ($script:ExcludedKB.Count -gt 0) {
+        Write-Log "Holding back $($script:ExcludedKB.Count) update(s): $(($script:ExcludedKB | ForEach-Object { "KB$_" }) -join ', ')"
+    }
+    return ,@($script:ExcludedKB)
+}
+
+# Kept out of the button so the parse, the save and the log line can be
+# exercised without a dialog.
+function Set-ExcludedKB {
+    param([string]$Text)
+    $script:ExcludedKB = ConvertTo-KBNumbers -Text $Text
+    Save-ExcludedKB
+    if ($script:ExcludedKB.Count -eq 0) {
+        Write-Log "No updates are held back any more"
+    } else {
+        Write-Log "Holding back $(($script:ExcludedKB | ForEach-Object { "KB$_" }) -join ', ')"
+    }
+    return ,@($script:ExcludedKB)
+}
+
+# The exclusion list travels as a prelude line rather than as a parameter: the
+# runner hands the payload over as text, so prepending an assignment keeps
+# $script:InstallPayload itself a plain script that the validator can parse.
+# The numbers are digits only by the time they get here, so there is nothing to
+# quote around.
+function Get-InstallPayload {
+    $quoted = @($script:ExcludedKB | ForEach-Object { "'$_'" }) -join ','
+    return "`$ExcludedKB = @($quoted)`r`n" + $script:InstallPayload
+}
 
 function Get-InstallTimeout {
     $item = $ui.cboInstallTimeout.SelectedItem
@@ -2100,27 +2220,156 @@ function Invoke-ScanServer {
     }.GetNewClosure()
 }
 
-function Invoke-InstallServer {
-    param([string]$ServerName)
+# -- Pre-flight ---------------------------------------------------------------
+# An install that runs the system drive dry fails with 0x80070070 about an hour
+# in, having spent the window and changed nothing. A disabled update agent fails
+# on the first call into it. Both facts cost one WinRM round trip to learn
+# beforehand, so they are learned beforehand.
+$script:MinFreeSpaceGB = 8
 
-    if (-not (Ensure-Credential)) { return }
+$script:PreflightScript = {
+    param([string]$ServerName, [PSCredential]$Credential)
+    try {
+        $facts = Invoke-Command -ComputerName $ServerName -Credential $Credential -ErrorAction Stop -ScriptBlock {
+            $sysDrive = $env:SystemDrive
+            $disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$sysDrive'" -ErrorAction Stop
+            $svc  = Get-CimInstance Win32_Service -Filter "Name='wuauserv'" -ErrorAction SilentlyContinue
+            # The two places Windows records that it wants restarting. Either is
+            # enough; neither is fatal on its own.
+            $pending = $false
+            foreach ($key in @(
+                'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
+                'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired')) {
+                if (Test-Path -LiteralPath $key) { $pending = $true }
+            }
+            [PSCustomObject]@{
+                FreeSpaceGB   = [math]::Round(($disk.FreeSpace / 1GB), 1)
+                ServiceExists = ($null -ne $svc)
+                StartMode     = if ($svc) { "$($svc.StartMode)" } else { "" }
+                RebootPending = $pending
+            }
+        }
+        [PSCustomObject]@{ Success = $true; Error = ""; Facts = $facts }
+    } catch {
+        [PSCustomObject]@{ Success = $false; Error = $_.Exception.Message; Facts = $null }
+    }
+}
+
+# Turns the facts into a verdict. Pure, and separate from the job that collects
+# them, so the thresholds can be argued with in the tests rather than on a
+# maintenance evening.
+function Test-InstallPreflight {
+    param($Result)
+
+    if (-not $Result -or -not $Result.Success) {
+        $why = if ($Result -and $Result.Error) { $Result.Error } else { "the check did not come back" }
+        return [PSCustomObject]@{ Ok = $false; Blockers = @("the pre-flight check failed: $why"); Warnings = @() }
+    }
+    $facts = $Result.Facts
+    if (-not $facts) {
+        return [PSCustomObject]@{ Ok = $false; Blockers = @("the pre-flight check returned nothing"); Warnings = @() }
+    }
+
+    $blockers = @()
+    $warnings = @()
+
+    if ($facts.FreeSpaceGB -lt $script:MinFreeSpaceGB) {
+        $blockers += "only $($facts.FreeSpaceGB) GB free on the system drive, $($script:MinFreeSpaceGB) GB wanted"
+    }
+    if (-not $facts.ServiceExists) {
+        $blockers += "the Windows Update service is not present"
+    } elseif ($facts.StartMode -eq 'Disabled') {
+        $blockers += "the Windows Update service is disabled"
+    }
+    # Deliberately not a blocker: plenty of estates patch on top of a pending
+    # reboot without trouble. It does explain a failure afterwards, which is the
+    # reason for saying it out loud beforehand.
+    if ($facts.RebootPending) {
+        $warnings += "a reboot is already pending - the install may fail until it is taken"
+    }
+
+    return [PSCustomObject]@{ Ok = ($blockers.Count -eq 0); Blockers = $blockers; Warnings = $warnings }
+}
+
+function Start-InstallPreflight {
+    param([string]$ServerName, [bool]$Sequential)
 
     Update-ServerEntry -ServerName $ServerName -Properties @{
-        Status    = "Installing..."
+        Status    = "Checking..."
         # Clear the count from the previous run. It is only written back when an
         # install succeeds, so leaving it meant a run that failed outright - a
         # dropped connection, a refusing update agent - kept showing yesterday's
         # number, as if those updates had just gone on.
         Installed = "-"
-        Details   = "Downloading and installing updates..."
+        Details   = "Checking disk space and the update agent before installing..."
     }
-    Write-Log "Installing updates on $ServerName..."
 
     $cred = Get-ServerCredential -ServerName $ServerName
-    Start-AsyncJob -ScriptBlock $script:RunAsSystemScript -Arguments @($ServerName, $cred, $script:InstallPayload, (Get-InstallTimeout), 'Install') -OnComplete {
+    Start-AsyncJob -ScriptBlock $script:PreflightScript -Arguments @($ServerName, $cred) -OnComplete {
+        param($result)
+        Complete-InstallPreflight -ServerName $ServerName -Sequential $Sequential -Result ($result | Select-Object -First 1)
+    }.GetNewClosure()
+}
+
+# Named, not folded into the callback above, for the usual reason: it reads and
+# writes $script: state and hands the sequential queue on, and neither survives
+# being done inside a closure.
+function Complete-InstallPreflight {
+    param([string]$ServerName, [bool]$Sequential, $Result)
+
+    $verdict = Test-InstallPreflight -Result $Result
+    foreach ($warning in $verdict.Warnings) {
+        Write-Log "$ServerName : $warning" "WARN"
+    }
+
+    if (-not $verdict.Ok) {
+        $why = $verdict.Blockers -join '; '
+        Update-ServerEntry -ServerName $ServerName -Properties @{
+            Status  = "Blocked"
+            Details = "Install not started: $why"
+        }
+        Write-Log "$ServerName : install not started - $why" "ERROR"
+        # The server still counted towards the batch, and a sequential queue
+        # that is not handed on here simply stops.
+        Step-Progress
+        if ($Sequential) { Step-SequentialInstallQueue }
+        return $false
+    }
+
+    Start-InstallJob -ServerName $ServerName -Sequential $Sequential
+    return $true
+}
+
+# The install proper. Single and sequential runs differed only in what they did
+# afterwards, which is now the one parameter.
+function Start-InstallJob {
+    param([string]$ServerName, [bool]$Sequential)
+
+    $holding = if ($script:ExcludedKB.Count -gt 0) {
+        " (holding back $(($script:ExcludedKB | ForEach-Object { "KB$_" }) -join ', '))"
+    } else { "" }
+    $mode = if ($Sequential) { " (sequential)" } else { "" }
+
+    Update-ServerEntry -ServerName $ServerName -Properties @{
+        Status    = "Installing..."
+        Installed = "-"
+        Details   = "Downloading and installing updates$holding$mode..."
+    }
+    Write-Log "Installing updates on $ServerName$mode$holding"
+
+    $cred = Get-ServerCredential -ServerName $ServerName
+    Start-AsyncJob -ScriptBlock $script:RunAsSystemScript -Arguments @($ServerName, $cred, (Get-InstallPayload), (Get-InstallTimeout), 'Install') -OnComplete {
         param($result)
         Complete-InstallResult -ServerName $ServerName -Result ($result | Select-Object -First 1)
+        if ($Sequential) { Step-SequentialInstallQueue }
     }.GetNewClosure()
+}
+
+function Invoke-InstallServer {
+    param([string]$ServerName)
+
+    if (-not (Ensure-Credential)) { return }
+    Start-InstallPreflight -ServerName $ServerName -Sequential $false
 }
 
 function Invoke-RebootServer {
@@ -2356,20 +2605,7 @@ function Invoke-InstallServerSequential {
         $script:SequentialRunning = $false
         return
     }
-
-    Update-ServerEntry -ServerName $ServerName -Properties @{
-        Status    = "Installing..."
-        Installed = "-"
-        Details   = "Downloading and installing updates... (sequential)"
-    }
-    Write-Log "Installing updates on $ServerName (sequential mode)..."
-
-    $cred = Get-ServerCredential -ServerName $ServerName
-    Start-AsyncJob -ScriptBlock $script:RunAsSystemScript -Arguments @($ServerName, $cred, $script:InstallPayload, (Get-InstallTimeout), 'Install') -OnComplete {
-        param($result)
-        Complete-InstallResult -ServerName $ServerName -Result ($result | Select-Object -First 1)
-        Step-SequentialInstallQueue
-    }.GetNewClosure()
+    Start-InstallPreflight -ServerName $ServerName -Sequential $true
 }
 
 # Helper function to run install on a list of servers (used by both Selected and All)
@@ -2692,6 +2928,30 @@ $ui.btnTestCredential.Add_Click({
     Invoke-CredentialTest -Label $label -ServerName $target.Trim() | Out-Null
 })
 
+# Updates to hold back on every install
+$ui.btnHeldBackKB.Add_Click({
+    $current = ($script:ExcludedKB | ForEach-Object { "KB$_" }) -join ', '
+    $msg = "Updates to skip on every install, by KB number.`n`n" +
+           "Separate them however you like - KB5120238, 5034441 - and clear the box to hold back nothing.`n`n" +
+           "Anything that is not a KB number is dropped."
+    try {
+        $answer = [Microsoft.VisualBasic.Interaction]::InputBox($msg, "Held-back KBs", $current)
+    } catch {
+        return
+    }
+    # An empty box is a real answer - it means hold nothing back - so it cannot
+    # simply be read as a cancelled dialog. InputBox returns "" for both, which
+    # is why Cancel is only honoured when the list was empty to begin with.
+    if (-not $answer -and -not $current) { return }
+
+    $kept = Set-ExcludedKB -Text $answer
+    $shown = if ($kept.Count -gt 0) {
+        ($kept | ForEach-Object { "KB$_" }) -join ', '
+    } else { "nothing" }
+    [System.Windows.MessageBox]::Show(
+        "Now holding back: $shown", "Held-back KBs", "OK", "Information") | Out-Null
+})
+
 # Context menu handlers
 $ui.ctxScan.Add_Click({
     $selected = $ui.dgServers.SelectedItem
@@ -2834,6 +3094,9 @@ Write-Log "Server Patch Tool started"
 
 # Load saved servers
 Load-ServerList
+
+# And whatever the operator has decided not to install
+Load-ExcludedKB | Out-Null
 
 # Restore saved credentials. Setting the checkbox fires Add_Checked, which
 # re-saves the same data - harmless, and it keeps the box honest about state.
