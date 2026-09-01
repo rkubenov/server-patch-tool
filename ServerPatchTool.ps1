@@ -287,6 +287,8 @@ if (-not (Test-Path -LiteralPath $script:LogDir)) {
                             ToolTip="View and remove saved credentials"/>
                     <Button x:Name="btnChangePassword" Content="Change Password" FontSize="12"
                             ToolTip="Replace the password stored for a saved credential"/>
+                    <Button x:Name="btnTestCredential" Content="Test" FontSize="12"
+                            ToolTip="Check that a saved credential still authenticates, before a maintenance window finds out the hard way"/>
                 </StackPanel>
             </Grid>
         </Border>
@@ -816,6 +818,37 @@ function Remove-CredentialSet {
     return $true
 }
 
+# The credential picker shared by Change Password and Test. One entry needs no
+# question at all; several use the numbered prompt the Assign Credential dialog
+# already uses, so every credential action reads the same way.
+function Select-CredentialLabel {
+    param([string]$Title, [string]$Prompt)
+
+    if ($script:Credentials.Count -eq 0) {
+        [System.Windows.MessageBox]::Show("No credentials added yet.", $Title, "OK", "Information") | Out-Null
+        return $null
+    }
+
+    $credList = @($script:Credentials.Keys)
+    if ($credList.Count -eq 1) { return $credList[0] }
+
+    $options = for ($i = 0; $i -lt $credList.Count; $i++) { "$($i+1). $($credList[$i])" }
+    $msg = "$Prompt`n`n$($options -join "`n")`n`nEnter the number:"
+    try {
+        $choice = [Microsoft.VisualBasic.Interaction]::InputBox($msg, $Title, "1")
+    } catch {
+        $choice = ""
+    }
+    if (-not $choice) { return $null }
+
+    $idx = 0
+    if ([int]::TryParse($choice, [ref]$idx) -and $idx -ge 1 -and $idx -le $credList.Count) {
+        return $credList[$idx - 1]
+    }
+    [System.Windows.MessageBox]::Show("That is not one of the listed numbers.", $Title, "OK", "Warning") | Out-Null
+    return $null
+}
+
 # Replaces the password on an existing credential set. The label is deliberately
 # left alone: it is the key every server entry stores, so changing it here would
 # strand each of them on an account that no longer exists. Kept out of the
@@ -890,6 +923,169 @@ function Ensure-Credential {
         return ($null -ne $result)
     }
     return $true
+}
+
+# -- Stale-password guard -----------------------------------------------------
+# A password rotated in the domain but not here is fired at every server in the
+# batch at once, and each rejection is a bad logon against the same account. A
+# fifty-server scan therefore walks straight into the domain lockout policy and
+# locks the very account the maintenance window depends on. These counters stop
+# the run before the policy does.
+$script:AuthFailureLimit = 2       # rejections tolerated before the run is halted
+$script:AuthFailures     = 0
+$script:AuthHaltPending  = $false
+$script:AuthHaltReason   = ""
+
+# "The server said no to this account", as opposed to "the server could not be
+# reached". Only the first kind is worth stopping a run over: an unreachable
+# server costs nothing but itself, while a rejected logon spends part of a
+# lockout budget shared with every other server in the batch.
+function Test-AuthFailure {
+    param([string]$ErrorText)
+    if (-not $ErrorText) { return $false }
+    return [bool]($ErrorText -match 'access is denied|access denied|logon failure|user name or password|username or password|password has expired|account has expired|locked out|no logon servers|0x8007052e|0x80070005|0x80070775|0x80070532|0x80070533')
+}
+
+# Being told the account is already locked is not a count-towards-the-limit
+# event. The damage is done, and every further attempt only extends the lockout
+# window, so this stops the run on its own.
+function Test-AccountLockedOut {
+    param([string]$ErrorText)
+    if (-not $ErrorText) { return $false }
+    return [bool]($ErrorText -match 'locked out|0x80070775')
+}
+
+# Reads the outcome of one finished job. Every operation returns the same
+# Success/Error shape, so hooking this into the job timer covers scans,
+# installs and reboots at once - and anything added later for free.
+#
+# Named rather than written into the tick itself for the usual reason: the
+# tick's completion callbacks are closures, and a $script: counter updated
+# inside one sets a copy that nobody ever reads.
+function Register-JobAuthOutcome {
+    param($Result)
+
+    $r = $Result | Select-Object -First 1
+    if (-not $r) { return }
+    if (-not ($r.PSObject.Properties.Name -contains 'Success')) { return }
+
+    # A success is proof the password is good. Whatever was counted before was
+    # about those servers rather than the account, so the budget goes back full.
+    if ($r.Success) {
+        $script:AuthFailures = 0
+        return
+    }
+
+    if (-not (Test-AuthFailure -ErrorText $r.Error)) { return }
+
+    # A deliberate one-off probe from the Test button must not arm the guard:
+    # the operator is watching that result, and a single logon is the whole
+    # point of the check.
+    if ($r.Probe) { return }
+
+    if (Test-AccountLockedOut -ErrorText $r.Error) {
+        $script:AuthHaltPending = $true
+        $script:AuthHaltReason  = "the account is already locked out"
+        return
+    }
+
+    $script:AuthFailures++
+    if ($script:AuthFailures -ge $script:AuthFailureLimit) {
+        $script:AuthHaltPending = $true
+        $script:AuthHaltReason  = "$($script:AuthFailures) logons in a row were rejected"
+    }
+}
+
+# Split out so the tests can exercise the guard without a window, and so the one
+# event that can cost a maintenance window cannot be missed in the log.
+function Show-AuthHaltNotice {
+    param([string]$Text, [string]$Title = "Logons are being rejected")
+    [System.Windows.MessageBox]::Show($Text, $Title, "OK", "Warning") | Out-Null
+}
+
+# Runs once per tick, after every finished job has been handled, so the run is
+# torn down between ticks rather than underneath a callback that is still
+# running and about to start the next server.
+function Step-AuthLockdown {
+    if (-not $script:AuthHaltPending) { return $false }
+
+    $reason = $script:AuthHaltReason
+    # Re-arm straight away: the operator fixes the password and starts again,
+    # and a guard that stayed tripped would be no guard at all.
+    $script:AuthHaltPending = $false
+    $script:AuthHaltReason  = ""
+    $script:AuthFailures    = 0
+
+    Stop-AllOperations -Reason "Halted because $reason"
+    $text = "The run was stopped because $reason. " +
+            "Every rejected logon spends part of the domain lockout budget for this account, " +
+            "and the rest of the batch would have spent the remainder. " +
+            "If the domain password was rotated, set the new one with Change Password, " +
+            "then confirm it with Test before starting again."
+    Write-Log $text "ERROR"
+    Show-AuthHaltNotice -Text $text
+    return $true
+}
+
+# -- Credential test ----------------------------------------------------------
+# Deliberately goes over WinRM with the same credential the real work uses: a
+# check that took a different route - an LDAP bind, say - could pass happily
+# while every scan still failed.
+$script:CredentialTestScript = {
+    param([string]$ServerName, [PSCredential]$Credential)
+    try {
+        $name = Invoke-Command -ComputerName $ServerName -Credential $Credential -ErrorAction Stop `
+            -ScriptBlock { $env:COMPUTERNAME }
+        [PSCustomObject]@{ Success = $true;  Error = ""; RemoteName = "$name"; Probe = $true }
+    } catch {
+        [PSCustomObject]@{ Success = $false; Error = $_.Exception.Message; RemoteName = ""; Probe = $true }
+    }
+}
+
+function Invoke-CredentialTest {
+    param([string]$Label, [string]$ServerName)
+
+    if (-not $Label -or -not $script:Credentials.ContainsKey($Label)) { return $false }
+    if (-not $ServerName) { return $false }
+
+    $cred = $script:Credentials[$Label]
+    Write-Log "Testing credential '$Label' against $ServerName"
+    Update-StatusBar "Testing credential against $ServerName..."
+
+    Start-AsyncJob -ScriptBlock $script:CredentialTestScript -Arguments @($ServerName, $cred) -OnComplete {
+        param($result)
+        Complete-CredentialTest -Label $Label -ServerName $ServerName -Result $result
+    }.GetNewClosure()
+    return $true
+}
+
+# The verdict, and what to do about it. Telling the two apart is the whole value
+# of the button: a rejected password and an unreachable server read almost the
+# same in the log but need opposite responses.
+function Complete-CredentialTest {
+    param([string]$Label, [string]$ServerName, $Result)
+
+    $r = $Result | Select-Object -First 1
+    if ($r -and $r.Success) {
+        Write-Log "Credential '$Label' authenticated against $ServerName (answered as $($r.RemoteName))"
+        Update-StatusBar "Credential OK"
+        Show-AuthHaltNotice -Title "Credential OK" `
+            -Text "'$Label' authenticated against $ServerName. The server answered as $($r.RemoteName)."
+        return $true
+    }
+
+    $err = if ($r -and $r.Error) { $r.Error } else { "no result came back from the test" }
+    $hint = if (Test-AuthFailure -ErrorText $err) {
+        "The server rejected the account. If the domain password was rotated, set the new one with Change Password."
+    } else {
+        "This does not look like a password problem: the server could not be reached, or WinRM refused the connection."
+    }
+
+    Write-Log "Credential '$Label' failed against $ServerName - $err" "ERROR"
+    Update-StatusBar "Credential test failed"
+    Show-AuthHaltNotice -Title "Credential test failed" `
+        -Text "'$Label' did not authenticate against $ServerName. $err $hint"
+    return $false
 }
 
 # -- Initialize Runspace Pool -------------------------------------------------
@@ -1564,6 +1760,10 @@ $script:JobTimer.Add_Tick({
         $script:ActiveJobs.Remove($job) | Out-Null
         try {
             $result = $job.PowerShell.EndInvoke($job.Handle)
+            # Before the callback, not after: the callback may start the next
+            # server, and a rejected logon should be counted before another one
+            # is spent.
+            Register-JobAuthOutcome -Result $result
             if ($job.OnComplete) {
                 & $job.OnComplete $result
             }
@@ -1573,6 +1773,10 @@ $script:JobTimer.Add_Tick({
             $job.PowerShell.Dispose()
         }
     }
+
+    # After every finished job has been handled, so the teardown never runs
+    # underneath a callback that is still going.
+    Step-AuthLockdown | Out-Null
 
     Step-PendingRechecks
 
@@ -1799,6 +2003,10 @@ function Start-RebootMonitor {
 # issued still happens. Statuses below say so rather than claiming everything
 # was cancelled.
 function Stop-AllOperations {
+    # The guard stops runs too, and "Stopped by user" in the log for a halt the
+    # user did not ask for would send the next investigation the wrong way.
+    param([string]$Reason = "Stopped by user")
+
     # Empty the queues first, so no completion handler can start the next server.
     $script:SequentialQueue.Clear()
     $script:RebootQueue.Clear()
@@ -1841,7 +2049,7 @@ function Stop-AllOperations {
     }
 
     Update-StatusBar "Stopped"
-    Write-Log "Stopped by user: $stopped job(s) cancelled, queues cleared" "WARN"
+    Write-Log "${Reason}: $stopped job(s) cancelled, queues cleared" "WARN"
 }
 
 function Invoke-ScanServer {
@@ -2440,31 +2648,8 @@ $ui.btnManageCredentials.Add_Click({
 
 # Change the password on an existing credential
 $ui.btnChangePassword.Add_Click({
-    if ($script:Credentials.Count -eq 0) {
-        [System.Windows.MessageBox]::Show("No credentials added yet.", "Change Password", "OK", "Information")
-        return
-    }
-
-    $credList = @($script:Credentials.Keys)
-    if ($credList.Count -eq 1) {
-        $label = $credList[0]
-    } else {
-        $options = for ($i = 0; $i -lt $credList.Count; $i++) { "$($i+1). $($credList[$i])" }
-        $msg = "Change the password of which credential?`n`n$($options -join "`n")`n`nEnter the number:"
-        try {
-            $choice = [Microsoft.VisualBasic.Interaction]::InputBox($msg, "Change Password", "1")
-        } catch {
-            $choice = ""
-        }
-        if (-not $choice) { return }
-        $idx = 0
-        if ([int]::TryParse($choice, [ref]$idx) -and $idx -ge 1 -and $idx -le $credList.Count) {
-            $label = $credList[$idx - 1]
-        } else {
-            [System.Windows.MessageBox]::Show("That is not one of the listed numbers.", "Change Password", "OK", "Warning")
-            return
-        }
-    }
+    $label = Select-CredentialLabel -Title "Change Password" -Prompt "Change the password of which credential?"
+    if (-not $label) { return }
 
     # The username box comes pre-filled but stays editable. Only the password is
     # taken from it: the label is what every server entry stores, so renaming an
@@ -2477,6 +2662,34 @@ $ui.btnChangePassword.Add_Click({
     if (-not (Set-CredentialPassword -Label $label -Password $cred.Password)) {
         [System.Windows.MessageBox]::Show("The password was not changed - it must not be empty.", "Change Password", "OK", "Warning")
     }
+})
+
+# Check that a credential still authenticates, before a maintenance window does
+$ui.btnTestCredential.Add_Click({
+    $label = Select-CredentialLabel -Title "Test Credential" -Prompt "Test which credential?"
+    if (-not $label) { return }
+
+    # Prefer whatever the operator is already looking at, then any server that
+    # uses this account, and only ask when the grid cannot answer.
+    $target = ""
+    $selected = $ui.dgServers.SelectedItem
+    if ($selected) {
+        $target = $selected.ServerName
+    } else {
+        $bound = @($script:ServerData | Where-Object { $_.CredentialLabel -eq $label } | Select-Object -First 1)
+        if ($bound.Count -gt 0) { $target = $bound[0].ServerName }
+    }
+    if (-not $target) {
+        try {
+            $target = [Microsoft.VisualBasic.Interaction]::InputBox(
+                "Test '$label' against which server?", "Test Credential", "")
+        } catch {
+            $target = ""
+        }
+    }
+    if (-not $target) { return }
+
+    Invoke-CredentialTest -Label $label -ServerName $target.Trim() | Out-Null
 })
 
 # Context menu handlers
