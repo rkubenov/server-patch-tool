@@ -3,7 +3,7 @@
 A PowerShell + WPF desktop tool for driving Windows Updates across domain-joined servers: scan for missing updates, install them, reboot, and confirm the result — all from one grid.
 
 > [!NOTE]
-> **Field status.** In use against test and production servers: scan, install, reboot, and the confirming scan afterwards. That includes a cumulative update that failed on one server while the rest of the batch installed cleanly, and sequential batches where each reboot waited for the previous server to come back before the next one was touched.
+> **Field status.** In use against test and production servers: scan, install, reboot, and the confirming scan afterwards. That includes a cumulative update that failed on one server while the rest of the batch installed cleanly, and sequential batches where each reboot waited for the previous server to come back before the next one was touched. Of the credential work, changing a stored password and testing one against a server have both been used in anger; the rest of the list below has not.
 
 ## What it does
 
@@ -160,7 +160,13 @@ Anything a callback needs to do therefore belongs in a named function. Function 
 - **One file, including the XAML.** Splitting it up would make more of it testable.
 - The grid rebuilds rows through `RemoveAt`/`Insert` rather than `INotifyPropertyChanged`, so it flickers on update.
 - `Get-StatusColor` is dead code: defined, never called.
-- **Two paths have not come up in practice yet:** importing from Active Directory, and the deferred re-checks that follow an install time-out. Both are covered by the tests; neither has been exercised against a live server.
+- **Several paths have not come up in practice yet.** Each is covered by the tests, and none has been exercised against a live server:
+  - importing from Active Directory;
+  - the deferred re-checks that follow an install time-out;
+  - the stale-password guard actually halting a run, including how well `Test-AuthFailure` recognises the wording the domain controllers really use - a formulation it does not match simply means the guard stays quiet;
+  - holding a KB back, end to end, as far as the server skipping it;
+  - the pre-flight blocking an install. Its 8 GB free-space threshold is an estimate for cumulative updates, not a measured figure for this estate: a server that normally runs closer to the line will start being blocked where it used to install.
+
 
 ## License
 
