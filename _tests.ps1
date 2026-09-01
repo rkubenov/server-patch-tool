@@ -40,6 +40,11 @@
                                  asked again, and eventually given up on.
      13. Time limits           - the install and reboot settings are read,
                                  with sane fallbacks.
+     14. Held-back updates    - the list must survive a restart intact, and
+                                 reach the server as a prelude.
+     15. Install pre-flight   - a full disk or a disabled update agent must
+                                 stop the install, a pending reboot must not,
+                                 and a failed check must never read as a pass.
 
     Not covered: anything that talks to a live server, and the UI event
     handlers whose logic still sits inside the handler itself.
@@ -305,24 +310,36 @@ Check "no rescan after a failure"              ($script:Rescans.Count -eq 0)
 Case "starting an install clears the count from last time"
 # The count is only written back on success, so a run that fails outright would
 # otherwise leave the previous number on screen as if it had just been achieved.
+# The clearing now happens at the pre-flight, which is the first thing an
+# install does, and again when the install proper starts.
 Invoke-Expression (Get-FunctionText -Name 'Invoke-InstallServer')
 Invoke-Expression (Get-FunctionText -Name 'Invoke-InstallServerSequential')
+Invoke-Expression (Get-FunctionText -Name 'Start-InstallPreflight')
+Invoke-Expression (Get-FunctionText -Name 'Start-InstallJob')
 
 function Ensure-Credential   { $true }
 function Get-ServerCredential { param([string]$ServerName) "cred" }
 function Get-InstallTimeout  { 5400 }
+function Get-InstallPayload  { "payload" }
 function Start-AsyncJob      { param($ScriptBlock, $Arguments, $OnComplete) }
 $script:RunAsSystemScript = { }
+$script:PreflightScript   = { }
 $script:InstallPayload    = "payload"
+$script:ExcludedKB        = @()
 
 $script:Props = @{}
 Invoke-InstallServer -ServerName 'srv-again'
 Check "the previous count is cleared"          ($script:Props.Installed -eq '-')
-Check "the row says an install is running"     ($script:Props.Status -eq 'Installing...')
+Check "the row says it is being checked"       ($script:Props.Status -eq 'Checking...')
 
 $script:Props = @{}
 Invoke-InstallServerSequential -ServerName 'srv-again'
 Check "the same holds in sequential mode"      ($script:Props.Installed -eq '-')
+
+$script:Props = @{}
+Start-InstallJob -ServerName 'srv-again' -Sequential $false
+Check "and again when the install itself starts" ($script:Props.Installed -eq '-')
+Check "the row says an install is running"     ($script:Props.Status -eq 'Installing...')
 
 Case "a failed install leaves no stale count behind"
 $script:Props = @{}
@@ -1002,6 +1019,189 @@ Set-RebootBox -Content $null
 Check "nothing selected gives the default"     ((Get-RebootTimeout) -eq $script:RebootTimeoutDefault)
 Set-RebootBox -Content 'not a number'
 Check "unparsable text gives the default"      ((Get-RebootTimeout) -eq $script:RebootTimeoutDefault)
+
+
+# =============================================================================
+Section "Held-back updates"
+# One bad cumulative can fail on every server in the estate. Until the vendor
+# fixes it, the only way through a window is to leave it out - so the list has
+# to survive a restart, and it has to reach the server intact.
+# =============================================================================
+Invoke-Expression (Get-FunctionText -Name 'ConvertTo-KBNumbers')
+Invoke-Expression (Get-FunctionText -Name 'Save-ExcludedKB')
+Invoke-Expression (Get-FunctionText -Name 'Load-ExcludedKB')
+Invoke-Expression (Get-FunctionText -Name 'Set-ExcludedKB')
+Invoke-Expression (Get-FunctionText -Name 'Get-InstallPayload')
+
+$script:CredDir        = Join-Path $env:TEMP "spt-kb-$PID"
+$script:ExcludedKBFile = Join-Path $script:CredDir 'excluded-kb.json'
+$script:InstallPayload = "# the real payload goes here"
+$script:ExcludedKB     = @()
+
+Case "whatever the operator types becomes bare KB numbers"
+$got = ConvertTo-KBNumbers -Text 'KB5120238, 5034441 kb5000802'
+Check "the prefix is dropped"                  ($got -contains '5120238')
+Check "a bare number is kept"                  ($got -contains '5034441')
+Check "lower case kb is handled"               ($got -contains '5000802')
+Check "all three survived"                     ($got.Count -eq 3)
+Check "nothing typed gives nothing"            ((ConvertTo-KBNumbers -Text '').Count -eq 0)
+
+Case "anything that is not a KB number is dropped"
+# A stray word would travel to every server and match nothing, which looks
+# exactly like a working exclusion until the update installs anyway.
+$got = ConvertTo-KBNumbers -Text 'KB5120238 rollup latest KB'
+Check "the real number is kept"                ($got -contains '5120238')
+Check "the words are not"                      ($got.Count -eq 1)
+
+Case "a KB is listed once however often it is typed"
+Check "one entry, not three"                   ((ConvertTo-KBNumbers -Text 'KB5120238 5120238 kb5120238').Count -eq 1)
+
+Case "the list survives a restart"
+Set-ExcludedKB -Text 'KB5120238, 5034441' | Out-Null
+$script:ExcludedKB = @()
+$back = Load-ExcludedKB
+Check "both came back"                         ($back.Count -eq 2)
+Check "as bare numbers"                        ($back -contains '5120238')
+
+Case "a single held-back KB is not split into digits"
+# ConvertTo-Json turns a one-element array into a bare string. Reading that back
+# character by character would hold back nothing and claim to hold back seven.
+Set-ExcludedKB -Text 'KB5120238' | Out-Null
+$script:ExcludedKB = @()
+$back = Load-ExcludedKB
+Check "exactly one entry came back"            ($back.Count -eq 1)
+Check "and it is the whole number"             ($back[0] -eq '5120238')
+
+Case "clearing the list removes the file"
+Set-ExcludedKB -Text '' | Out-Null
+Check "nothing is held back"                   ($script:ExcludedKB.Count -eq 0)
+Check "the file is gone"                       (-not (Test-Path -LiteralPath $script:ExcludedKBFile))
+$script:ExcludedKB = @()
+Check "and nothing comes back"                 ((Load-ExcludedKB).Count -eq 0)
+
+Case "the list reaches the server as a prelude"
+$script:ExcludedKB = @('5120238','5034441')
+$payload   = Get-InstallPayload
+$firstLine = ($payload -split '\r\n')[0]
+Check "the assignment comes first"             ($firstLine -eq ('$' + "ExcludedKB = @('5120238','5034441')"))
+Check "the real payload follows"               ($payload -match 'the real payload goes here')
+$script:ExcludedKB = @()
+$firstLine = ((Get-InstallPayload) -split '\r\n')[0]
+Check "an empty list still assigns"            ($firstLine -eq ('$' + "ExcludedKB = @()"))
+
+if (Test-Path -LiteralPath $script:CredDir) {
+    Remove-Item -LiteralPath $script:CredDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+
+# =============================================================================
+Section "Install pre-flight"
+# An install that runs the system drive dry fails with 0x80070070 about an hour
+# in, having spent the window and changed nothing. The same fact costs one WinRM
+# round trip to learn beforehand - provided a failed check is never mistaken for
+# a clean bill of health.
+# =============================================================================
+Invoke-Expression (Get-AssignmentText -VariablePath '$script:MinFreeSpaceGB')
+Invoke-Expression (Get-FunctionText   -Name 'Test-InstallPreflight')
+Invoke-Expression (Get-FunctionText   -Name 'Complete-InstallPreflight')
+
+function New-Facts {
+    param([double]$FreeGB = 50, [bool]$ServiceExists = $true,
+          [string]$StartMode = 'Manual', [bool]$RebootPending = $false)
+    [PSCustomObject]@{
+        Success = $true
+        Error   = ''
+        Facts   = [PSCustomObject]@{
+            FreeSpaceGB   = $FreeGB
+            ServiceExists = $ServiceExists
+            StartMode     = $StartMode
+            RebootPending = $RebootPending
+        }
+    }
+}
+function New-FailedCheck {
+    param([string]$ErrorText)
+    [PSCustomObject]@{ Success = $false; Error = $ErrorText; Facts = $null }
+}
+
+Case "a healthy server is cleared to install"
+$v = Test-InstallPreflight -Result (New-Facts)
+Check "it passes"                              ($v.Ok)
+Check "with nothing to say"                    (($v.Blockers.Count -eq 0) -and ($v.Warnings.Count -eq 0))
+
+Case "a full system drive stops the install before it starts"
+$v = Test-InstallPreflight -Result (New-Facts -FreeGB ($script:MinFreeSpaceGB - 1))
+Check "it does not pass"                       (-not $v.Ok)
+Check "the reason names the space"             ($v.Blockers[0] -match 'free on the system drive')
+Check "and how much was wanted"                ($v.Blockers[0] -match "$($script:MinFreeSpaceGB) GB wanted")
+
+Case "exactly the wanted amount is enough"
+Check "the boundary is not a blocker"          ((Test-InstallPreflight -Result (New-Facts -FreeGB $script:MinFreeSpaceGB)).Ok)
+
+Case "an update agent that cannot run stops the install"
+$v = Test-InstallPreflight -Result (New-Facts -StartMode 'Disabled')
+Check "a disabled service blocks"              (-not $v.Ok)
+Check "the reason says which service"          ($v.Blockers[0] -match 'Windows Update service is disabled')
+$v = Test-InstallPreflight -Result (New-Facts -ServiceExists $false)
+Check "a missing service blocks"               (-not $v.Ok)
+Check "the reason says it is not there"        ($v.Blockers[0] -match 'not present')
+
+Case "a pending reboot is said out loud, not treated as fatal"
+$v = Test-InstallPreflight -Result (New-Facts -RebootPending $true)
+Check "the install still goes ahead"           ($v.Ok)
+Check "but the risk is named"                  ($v.Warnings[0] -match 'reboot is already pending')
+
+Case "a check that never came back is not read as a pass"
+$v = Test-InstallPreflight -Result (New-FailedCheck -ErrorText 'WinRM connection failed')
+Check "an outright failure blocks"             (-not $v.Ok)
+Check "the cause is kept"                      ($v.Blockers[0] -match 'WinRM connection failed')
+Check "nothing at all blocks"                  (-not (Test-InstallPreflight -Result $null).Ok)
+Check "success with no facts blocks"           (-not (Test-InstallPreflight -Result ([PSCustomObject]@{ Success = $true; Error = ''; Facts = $null })).Ok)
+
+$script:Props   = @{}
+$script:Started = @()
+$script:Steps   = 0
+$script:Handed  = 0
+function Update-ServerEntry { param([string]$ServerName, [hashtable]$Properties) $script:Props = $Properties }
+function Step-Progress { $script:Steps++ }
+function Step-SequentialInstallQueue { $script:Handed++ }
+function Start-InstallJob { param([string]$ServerName, [bool]$Sequential) $script:Started += $ServerName }
+function Reset-Preflight {
+    $script:Props = @{}; $script:Started = @(); $script:Steps = 0; $script:Handed = 0; $script:Logged = @()
+}
+
+Case "a blocked server is reported and the sequential queue moves on"
+# A queue that is not handed on here does not fail, it simply stops - and the
+# rest of the maintenance window quietly never happens.
+Reset-Preflight
+$ok = Complete-InstallPreflight -ServerName 'srv-full' -Sequential $true -Result (New-Facts -FreeGB 1)
+Check "it reports that it blocked"             ($ok -eq $false)
+Check "no install was started"                 ($script:Started.Count -eq 0)
+Check "the row is marked blocked"              ($script:Props.Status -eq 'Blocked')
+Check "the row says why"                       ($script:Props.Details -match 'free on the system drive')
+Check "it is logged as an error"               ((Get-LoggedLike 'ERROR|*').Count -eq 1)
+Check "the server still counted"               ($script:Steps -eq 1)
+Check "the queue moved on"                     ($script:Handed -eq 1)
+
+Case "a blocked server outside a sequential run leaves the queue alone"
+Reset-Preflight
+Complete-InstallPreflight -ServerName 'srv-full' -Sequential $false -Result (New-Facts -FreeGB 1) | Out-Null
+Check "the queue was not touched"              ($script:Handed -eq 0)
+Check "the server still counted"               ($script:Steps -eq 1)
+
+Case "a server that passes goes straight to the install"
+Reset-Preflight
+$ok = Complete-InstallPreflight -ServerName 'srv-ok' -Sequential $false -Result (New-Facts)
+Check "it reports that it started"             ($ok -eq $true)
+Check "the install was started"                ($script:Started -contains 'srv-ok')
+Check "the queue was not handed on"            ($script:Handed -eq 0)
+Check "progress was not counted twice"         ($script:Steps -eq 0)
+
+Case "a warning is logged even when the install goes ahead"
+Reset-Preflight
+$ok = Complete-InstallPreflight -ServerName 'srv-pending' -Sequential $false -Result (New-Facts -RebootPending $true)
+Check "the install still started"              ($ok -eq $true)
+Check "the pending reboot is in the log"       ((Get-LoggedLike 'WARN|*reboot is already pending*').Count -eq 1)
 
 
 # =============================================================================

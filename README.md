@@ -13,6 +13,7 @@ A PowerShell + WPF desktop tool for driving Windows Updates across domain-joined
 - Import the server list from a file or from Active Directory
 - Several credential sets, for different domains, bound to individual servers, with in-place password changes
 - A stale stored password is caught before a run, and stops one before it locks the account
+- Named updates held back across every install, and a pre-flight that refuses an install that cannot succeed
 - Export results to CSV
 
 ## Requirements
@@ -75,6 +76,7 @@ The `Installed` column refers only to the most recent install run: it is cleared
 | Server list and results | `servers.json` next to the script | Gitignored — contains host names |
 | Tool log | `logs/ServerPatchTool_YYYYMMDD.log` | One file per day |
 | Credentials | `%LOCALAPPDATA%\ServerPatchTool\credentials.json` | Only with "Remember" ticked |
+| Held-back KBs | `%LOCALAPPDATA%\ServerPatchTool\excluded-kb.json` | Removed when the list is cleared |
 
 `servers.json` format:
 
@@ -109,7 +111,16 @@ That matters because of what the tool does with a password that has been rotated
 
 A rotated domain password is changed in place with the "Change Password" button: the stored username stays exactly as it was, so every server already bound to that account keeps working, and the new password is written to the file straight away rather than only living until the tool is closed.
 
+## Before an install
+
+Two things happen before any update is downloaded.
+
+**Held-back KBs.** One bad cumulative fails on every server in the estate, and until the vendor fixes it the only way through a window was to let it fail again each time. The "Held-back KBs" button takes a list of KB numbers - typed however you like, KB5120238 or 5120238 - and every install skips them until the list is cleared. The list travels to each server as a prelude line prepended to the install payload, so the update agent never selects those updates at all, rather than being told to undo them afterwards. Anything typed that is not a KB number is dropped rather than sent: a stray word would match nothing on the server and look exactly like a working exclusion, right up to the moment the update installs anyway.
+
+**Pre-flight.** An install that runs the system drive dry fails with 0x80070070 about an hour in, having spent the window and changed nothing, and a disabled update agent fails on the first call into it. Both facts cost one WinRM round trip to learn beforehand, so they are learned beforehand. A server with less than 8 GB free on its system drive, or with the Windows Update service disabled or missing, is marked "Blocked" with the reason and no install is started - and in a sequential run the queue moves straight on to the next server rather than stopping. A reboot that is already pending is reported as a warning instead: plenty of estates patch on top of one, and it is worth having in the log when a failure follows.
+
 ## Checks before changing anything
+
 
 ```bash
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File _validate.ps1
@@ -121,9 +132,9 @@ Parses the main file, loads the XAML markup, checks that every named control res
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File _tests.ps1
 ```
 
-Behavioural tests — 206 checks, no live server and no window required. The tool is a single file that builds a window as it loads, so it cannot simply be dot-sourced; instead each unit under test is located in the real file with the PowerShell parser and evaluated on its own against stubs. That way the shipped code is exercised rather than a copy of it, and a test fails loudly if the code it targets is renamed or moved.
+Behavioural tests — 257 checks, no live server and no window required. The tool is a single file that builds a window as it loads, so it cannot simply be dot-sourced; instead each unit under test is located in the real file with the PowerShell parser and evaluated on its own against stubs. That way the shipped code is exercised rather than a copy of it, and a test fails loudly if the code it targets is renamed or moved.
 
-Covered: the job completion timer, install reporting, credential selection, removal and password changes, the stale-password guard and the credential test, the post-reboot monitor and how it is launched, the sequential queues, deferred re-checks, and both time limits.
+Covered: the job completion timer, install reporting, credential selection, removal and password changes, the stale-password guard and the credential test, held-back updates and the install pre-flight, the post-reboot monitor and how it is launched, the sequential queues, deferred re-checks, and both time limits.
 
 > [!IMPORTANT]
 > `.ps1` files are stored **without a BOM**, so PowerShell 5.1 reads them in the system's single-byte code page. Code and strings must stay ASCII. The validator checks this.
