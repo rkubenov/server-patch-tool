@@ -281,41 +281,63 @@ if (-not (Test-Path -LiteralPath $script:LogDir)) {
                     <CheckBox x:Name="chkRememberCredentials" Content="Remember"
                               Margin="0,0,10,0" FontSize="12" VerticalAlignment="Center"
                               ToolTip="Save credentials for the next launch. Encrypted for your Windows account on this computer only - the file is useless elsewhere."/>
-                    <Button x:Name="btnAddCredential" Content="Add Credential" FontSize="12"
-                            ToolTip="Add a new credential set (domain\username)"/>
-                    <Button x:Name="btnManageCredentials" Content="Manage" FontSize="12"
-                            ToolTip="View and remove saved credentials"/>
-                    <Button x:Name="btnChangePassword" Content="Change Password" FontSize="12"
-                            ToolTip="Replace the password stored for a saved credential"/>
-                    <Button x:Name="btnTestCredential" Content="Test" FontSize="12"
-                            ToolTip="Check that a saved credential still authenticates, before a maintenance window finds out the hard way"/>
+                    <!-- The four credential actions live in a drop-down so the header
+                         fits a small screen. The menu items keep the names the
+                         Click handlers are wired to. -->
+                    <Button x:Name="btnCredentialsMenu" Content="Credentials &#x25BE;" FontSize="12"
+                            ToolTip="Add, manage, change the password of, or test a credential">
+                        <Button.ContextMenu>
+                            <ContextMenu>
+                                <MenuItem x:Name="btnAddCredential" Header="Add Credential..."
+                                          ToolTip="Add a new credential set (domain\username)"/>
+                                <MenuItem x:Name="btnManageCredentials" Header="Manage..."
+                                          ToolTip="View and remove saved credentials"/>
+                                <MenuItem x:Name="btnChangePassword" Header="Change Password..."
+                                          ToolTip="Replace the password stored for a saved credential"/>
+                                <Separator/>
+                                <MenuItem x:Name="btnTestCredential" Header="Test Credential..."
+                                          ToolTip="Check that a saved credential still authenticates, before a maintenance window finds out the hard way"/>
+                            </ContextMenu>
+                        </Button.ContextMenu>
+                    </Button>
                 </StackPanel>
             </Grid>
         </Border>
 
-        <!-- Toolbar -->
-        <Border Grid.Row="1" Background="#181825" CornerRadius="6" Padding="10" Margin="0,0,0,10">
-            <Grid>
-                <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="*"/>
-                    <ColumnDefinition Width="Auto"/>
-                </Grid.ColumnDefinitions>
+        <!-- Toolbar: one row per job - the server list, how a run behaves, and
+             the runs themselves - so nothing is pushed off a small screen.
+             Rows 2 and 3 wrap rather than clip if the window is narrower still. -->
+        <Border Grid.Row="1" Background="#181825" CornerRadius="6" Padding="10,6" Margin="0,0,0,10">
+            <StackPanel>
 
-                <!-- Add servers -->
-                <StackPanel Grid.Column="0" Orientation="Horizontal">
-                    <TextBox x:Name="txtServerName" Width="260" VerticalContentAlignment="Center"
+                <!-- Row 1: server list -->
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBox Grid.Column="0" x:Name="txtServerName" MinWidth="180" Margin="3"
+                             VerticalContentAlignment="Center"
                              ToolTip="Enter server name(s) separated by commas, or an AD search filter"/>
-                    <Button x:Name="btnAddServer" Content="Add Server(s)" Style="{StaticResource AccentButton}"/>
-                    <Button x:Name="btnBrowseAD" Content="Browse AD" ToolTip="Import servers from Active Directory OU"/>
-                    <Button x:Name="btnImportFile" Content="Import CSV" ToolTip="Import server list from text/CSV file"/>
-                    <Border Width="1" Background="#45475a" Margin="8,2"/>
-                    <Button x:Name="btnRemoveSelected" Content="Remove Selected"/>
-                    <Button x:Name="btnClearAll" Content="Clear All"/>
-                </StackPanel>
+                    <StackPanel Grid.Column="1" Orientation="Horizontal">
+                        <Button x:Name="btnAddServer" Content="Add Server(s)" Style="{StaticResource AccentButton}"/>
+                        <Button x:Name="btnBrowseAD" Content="Browse AD" ToolTip="Import servers from Active Directory OU"/>
+                        <Button x:Name="btnImportFile" Content="Import CSV" ToolTip="Import server list from text/CSV file"/>
+                        <Border Width="1" Background="#45475a" Margin="8,2"/>
+                        <Button x:Name="btnRemoveSelected" Content="Remove Selected"/>
+                        <Button x:Name="btnClearAll" Content="Clear All"/>
+                    </StackPanel>
+                    <StackPanel Grid.Column="2" Orientation="Horizontal">
+                        <Border Width="1" Background="#45475a" Margin="8,2"/>
+                        <Button x:Name="btnExportCSV" Content="Export" ToolTip="Export results to CSV"/>
+                    </StackPanel>
+                </Grid>
 
-                <!-- Bulk actions -->
-                <StackPanel Grid.Column="1" Orientation="Horizontal">
-                    <Border Width="1" Background="#45475a" Margin="8,2"/>
+                <Border Height="1" Background="#313244" Margin="0,6"/>
+
+                <!-- Row 2: run settings -->
+                <WrapPanel Orientation="Horizontal">
                     <TextBlock Text="Mode:" Foreground="#a6adc8" VerticalAlignment="Center"
                                Margin="4,0,4,0" FontSize="12"/>
                     <Border Background="#313244" CornerRadius="4" Padding="2" VerticalAlignment="Center">
@@ -371,27 +393,36 @@ if (-not (Test-Path -LiteralPath $script:LogDir)) {
                     </ComboBox>
                     <Button x:Name="btnHeldBackKB" Content="Held-back KBs" FontSize="12" Margin="10,0,0,0"
                             ToolTip="Updates to skip on every install - for a cumulative that is known to fail here, or one waiting on a vendor fix"/>
-                    <Border Width="1" Background="#45475a" Margin="8,2"/>
-                    <Button x:Name="btnScanSelected" Content="Scan Selected" Style="{StaticResource AccentButton}"
-                            ToolTip="Check for updates on checked servers only"/>
-                    <Button x:Name="btnInstallSelected" Content="Install Selected" Style="{StaticResource SuccessButton}"
-                            ToolTip="Install updates on checked servers only"/>
-                    <Button x:Name="btnRebootSelected" Content="Reboot Selected" Style="{StaticResource DangerButton}"
-                            ToolTip="Reboot checked servers that require it"/>
-                    <Border Width="1" Background="#45475a" Margin="8,2"/>
-                    <Button x:Name="btnScanAll" Content="Scan All" Style="{StaticResource AccentButton}"
-                            ToolTip="Check for available updates on ALL servers"/>
-                    <Button x:Name="btnInstallAll" Content="Install All" Style="{StaticResource SuccessButton}"
-                            ToolTip="Install available updates on ALL servers"/>
-                    <Button x:Name="btnRebootAll" Content="Reboot All" Style="{StaticResource DangerButton}"
-                            ToolTip="Reboot ALL servers that require it"/>
-                    <Border Width="1" Background="#45475a" Margin="8,2"/>
-                    <Button x:Name="btnExportCSV" Content="Export" ToolTip="Export results to CSV"/>
-                    <Button x:Name="btnStop" Content="Stop" Style="{StaticResource DangerButton}"
-                            IsEnabled="False"
-                            ToolTip="Stop queued work and stop monitoring. Work already sent to a server cannot be recalled."/>
-                </StackPanel>
-            </Grid>
+                </WrapPanel>
+
+                <Border Height="1" Background="#313244" Margin="0,6"/>
+
+                <!-- Row 3: runs. Stop stays pinned to the right edge where it is
+                     easy to find in a hurry. -->
+                <DockPanel LastChildFill="True">
+                    <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                        <Border Width="1" Background="#45475a" Margin="8,2"/>
+                        <Button x:Name="btnStop" Content="Stop" Style="{StaticResource DangerButton}"
+                                IsEnabled="False"
+                                ToolTip="Stop queued work and stop monitoring. Work already sent to a server cannot be recalled."/>
+                    </StackPanel>
+                    <WrapPanel Orientation="Horizontal">
+                        <Button x:Name="btnScanSelected" Content="Scan Selected" Style="{StaticResource AccentButton}"
+                                ToolTip="Check for updates on checked servers only"/>
+                        <Button x:Name="btnInstallSelected" Content="Install Selected" Style="{StaticResource SuccessButton}"
+                                ToolTip="Install updates on checked servers only"/>
+                        <Button x:Name="btnRebootSelected" Content="Reboot Selected" Style="{StaticResource DangerButton}"
+                                ToolTip="Reboot checked servers that require it"/>
+                        <Border Width="1" Background="#45475a" Margin="8,2"/>
+                        <Button x:Name="btnScanAll" Content="Scan All" Style="{StaticResource AccentButton}"
+                                ToolTip="Check for available updates on ALL servers"/>
+                        <Button x:Name="btnInstallAll" Content="Install All" Style="{StaticResource SuccessButton}"
+                                ToolTip="Install available updates on ALL servers"/>
+                        <Button x:Name="btnRebootAll" Content="Reboot All" Style="{StaticResource DangerButton}"
+                                ToolTip="Reboot ALL servers that require it"/>
+                    </WrapPanel>
+                </DockPanel>
+            </StackPanel>
         </Border>
 
         <!-- Server Grid -->
@@ -1022,7 +1053,7 @@ function Step-AuthLockdown {
     $text = "The run was stopped because $reason. " +
             "Every rejected logon spends part of the domain lockout budget for this account, " +
             "and the rest of the batch would have spent the remainder. " +
-            "If the domain password was rotated, set the new one with Change Password, " +
+            "If the domain password was rotated, set the new one with Credentials > Change Password, " +
             "then confirm it with Test before starting again."
     Write-Log $text "ERROR"
     Show-AuthHaltNotice -Text $text
@@ -1078,7 +1109,7 @@ function Complete-CredentialTest {
 
     $err = if ($r -and $r.Error) { $r.Error } else { "no result came back from the test" }
     $hint = if (Test-AuthFailure -ErrorText $err) {
-        "The server rejected the account. If the domain password was rotated, set the new one with Change Password."
+        "The server rejected the account. If the domain password was rotated, set the new one with Credentials > Change Password."
     } else {
         "This does not look like a password problem: the server could not be reached, or WinRM refused the connection."
     }
@@ -2854,6 +2885,14 @@ $ui.btnExportCSV.Add_Click({
     }
 })
 
+# Credentials drop-down: a left click opens the button's menu under it
+$ui.btnCredentialsMenu.Add_Click({
+    $menu = $ui.btnCredentialsMenu.ContextMenu
+    $menu.PlacementTarget = $ui.btnCredentialsMenu
+    $menu.Placement = [System.Windows.Controls.Primitives.PlacementMode]::Bottom
+    $menu.IsOpen = $true
+})
+
 # Add credential
 $ui.btnAddCredential.Add_Click({
     Add-CredentialSet -Message "Enter credentials (domain\username)`nMultiple credential sets can be added for different domains."
@@ -2993,7 +3032,7 @@ $ui.ctxAssignCredential.Add_Click({
 
     if ($script:Credentials.Count -eq 0) {
         [System.Windows.MessageBox]::Show(
-            "No credentials available. Add a credential first using the 'Add Credential' button.",
+            "No credentials available. Add a credential first via Credentials > Add Credential.",
             "No Credentials", "OK", "Information"
         )
         return
@@ -3111,7 +3150,7 @@ $window.Add_ContentRendered({
     if ($script:Credentials.Count -gt 0) { return }
     $result = Add-CredentialSet -Message "Enter primary credentials for server management (domain\username)`nYou can add more credentials later for other domains."
     if (-not $result) {
-        Write-Log "No credentials provided. Add credentials via the 'Add Credential' button." "WARN"
+        Write-Log "No credentials provided. Add credentials via Credentials > Add Credential." "WARN"
     }
 })
 

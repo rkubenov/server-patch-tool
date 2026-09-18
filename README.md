@@ -105,11 +105,11 @@ Saving the password is **optional**, via the "Remember" checkbox. It is encrypte
 
 Unticking the box deletes the file immediately, not on exit. Removing a credential rewrites the file, so a deleted account does not reappear on the next launch — including when it was the last one, in which case the file is removed rather than written empty.
 
-The "Test" button proves a stored credential still authenticates before a maintenance window finds out the hard way. It opens one WinRM session against a single server, deliberately over the same path the real work uses, and says which of the two things went wrong: a rejected account sends you to Change Password, an unreachable server does not.
+"Credentials ▾ → Test Credential" proves a stored credential still authenticates before a maintenance window finds out the hard way. It opens one WinRM session against a single server, deliberately over the same path the real work uses, and says which of the two things went wrong: a rejected account sends you to Change Password in the same menu, an unreachable server does not.
 
 That matters because of what the tool does with a password that has been rotated in the domain but not here. It fires the account at every server in the batch at once, and each rejection is a bad logon against the same account, so a fifty-server scan walks straight into the domain lockout policy and locks the account the maintenance window depends on. The guard counts rejected logons across the whole run, stops it once two in a row come back rejected, and stops it immediately if a server reports the account already locked. A server that is merely unreachable does not count, and a single success anywhere clears the count - so a run only halts when the account itself looks like the problem.
 
-A rotated domain password is changed in place with the "Change Password" button: the stored username stays exactly as it was, so every server already bound to that account keeps working, and the new password is written to the file straight away rather than only living until the tool is closed.
+A rotated domain password is changed in place with "Credentials ▾ → Change Password": the stored username stays exactly as it was, so every server already bound to that account keeps working, and the new password is written to the file straight away rather than only living until the tool is closed.
 
 ## Before an install
 
