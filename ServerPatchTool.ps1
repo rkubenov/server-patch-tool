@@ -177,21 +177,97 @@ if (-not (Test-Path -LiteralPath $script:LogDir)) {
             <Setter Property="CaretBrush" Value="#cdd6f4"/>
         </Style>
 
+        <!-- The stock ComboBox template ignores Background and paints its own
+             light-grey face, so the light text on it was all but invisible.
+             This template draws the whole control in the dark theme. -->
         <Style TargetType="ComboBox">
             <Setter Property="Background" Value="#313244"/>
             <Setter Property="Foreground" Value="#cdd6f4"/>
             <Setter Property="BorderBrush" Value="#585b70"/>
             <Setter Property="FontSize" Value="13"/>
             <Setter Property="Padding" Value="6,4"/>
+            <Setter Property="Height" Value="28"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ComboBox">
+                        <Grid>
+                            <ToggleButton Focusable="False" ClickMode="Press"
+                                          IsChecked="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}">
+                                <ToggleButton.Template>
+                                    <ControlTemplate TargetType="ToggleButton">
+                                        <Border x:Name="face" Background="#313244" BorderBrush="#585b70"
+                                                BorderThickness="1" CornerRadius="4">
+                                            <Path x:Name="arrow" Data="M 0 0 L 4 4 L 8 0 Z" Fill="#a6adc8"
+                                                  HorizontalAlignment="Right" VerticalAlignment="Center" Margin="0,0,7,0"/>
+                                        </Border>
+                                        <ControlTemplate.Triggers>
+                                            <Trigger Property="IsMouseOver" Value="True">
+                                                <Setter TargetName="face" Property="BorderBrush" Value="#89b4fa"/>
+                                            </Trigger>
+                                            <Trigger Property="IsChecked" Value="True">
+                                                <Setter TargetName="face" Property="BorderBrush" Value="#89b4fa"/>
+                                            </Trigger>
+                                            <Trigger Property="IsEnabled" Value="False">
+                                                <Setter TargetName="face" Property="Background" Value="#252536"/>
+                                                <Setter TargetName="face" Property="BorderBrush" Value="#45475a"/>
+                                                <Setter TargetName="arrow" Property="Fill" Value="#585b70"/>
+                                            </Trigger>
+                                        </ControlTemplate.Triggers>
+                                    </ControlTemplate>
+                                </ToggleButton.Template>
+                            </ToggleButton>
+                            <ContentPresenter IsHitTestVisible="False" Margin="8,0,20,0"
+                                              HorizontalAlignment="Left" VerticalAlignment="Center"
+                                              Content="{TemplateBinding SelectionBoxItem}"
+                                              ContentTemplate="{TemplateBinding SelectionBoxItemTemplate}"
+                                              ContentTemplateSelector="{TemplateBinding ItemTemplateSelector}"/>
+                            <Popup x:Name="PART_Popup" Placement="Bottom" AllowsTransparency="True"
+                                   Focusable="False" PopupAnimation="Slide"
+                                   IsOpen="{TemplateBinding IsDropDownOpen}">
+                                <Border Background="#313244" BorderBrush="#585b70" BorderThickness="1"
+                                        CornerRadius="4" Margin="0,2,0,0" Padding="0,2"
+                                        MinWidth="{Binding ActualWidth, RelativeSource={RelativeSource TemplatedParent}}"
+                                        MaxHeight="{TemplateBinding MaxDropDownHeight}">
+                                    <ScrollViewer>
+                                        <ItemsPresenter KeyboardNavigation.DirectionalNavigation="Contained"/>
+                                    </ScrollViewer>
+                                </Border>
+                            </Popup>
+                        </Grid>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter Property="Foreground" Value="#585b70"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
         </Style>
 
-        <!-- Without this the dropdown items keep the system's light background
-             and the light foreground above becomes unreadable. -->
         <Style TargetType="ComboBoxItem">
             <Setter Property="Background" Value="#313244"/>
             <Setter Property="Foreground" Value="#cdd6f4"/>
-            <Setter Property="Padding" Value="6,3"/>
+            <Setter Property="Padding" Value="8,3"/>
             <Setter Property="FontSize" Value="13"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ComboBoxItem">
+                        <Border x:Name="row" Background="{TemplateBinding Background}"
+                                Padding="{TemplateBinding Padding}">
+                            <ContentPresenter/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsSelected" Value="True">
+                                <Setter Property="Foreground" Value="#89b4fa"/>
+                                <Setter Property="FontWeight" Value="SemiBold"/>
+                            </Trigger>
+                            <Trigger Property="IsHighlighted" Value="True">
+                                <Setter TargetName="row" Property="Background" Value="#45475a"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
         </Style>
 
         <Style TargetType="CheckBox">
