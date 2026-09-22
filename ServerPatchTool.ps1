@@ -516,7 +516,7 @@ if (-not (Test-Path -LiteralPath $script:LogDir)) {
                 <DataGridCheckBoxColumn Binding="{Binding Selected, UpdateSourceTrigger=PropertyChanged}"
                                         Header="" Width="30" IsReadOnly="False"/>
                 <DataGridTextColumn Binding="{Binding ServerName}" Header="Server" Width="160" IsReadOnly="True"/>
-                <DataGridTextColumn Binding="{Binding CredentialLabel}" Header="Credential" Width="110" IsReadOnly="True"/>
+                <DataGridTextColumn Binding="{Binding CredentialLabel}" Header="Credential" Width="150" IsReadOnly="True"/>
                 <DataGridTextColumn Binding="{Binding Status}" Header="Status" Width="120" IsReadOnly="True"/>
                 <DataGridTextColumn Binding="{Binding Available}" Header="Available" Width="80" IsReadOnly="True"/>
                 <DataGridTextColumn Binding="{Binding Installed}" Header="Installed" Width="80" IsReadOnly="True"/>
