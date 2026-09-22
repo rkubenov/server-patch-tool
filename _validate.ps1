@@ -69,6 +69,31 @@ try {
         } else {
             Write-Host "  OK - XAML loads, all $($names.Count) named controls resolve" -ForegroundColor Green
         }
+
+        # The patch-window dialog is loaded the way the tool loads it: with the
+        # main window's styles copied in, which its StaticResources depend on.
+        $dlgPattern = '(?s)\$script:PatchWindowXaml\s*=\s*@' + [char]39 + '\r?\n(.*?)\r?\n' + [char]39 + '@'
+        $dlgMatch = [regex]::Match($text, $dlgPattern)
+        if (-not $dlgMatch.Success) {
+            Write-Host "  ERROR - could not locate the patch-window dialog markup" -ForegroundColor Red
+            $failed = $true
+        } else {
+            $res = $xamlDoc.DocumentElement.ChildNodes |
+                Where-Object { $_.LocalName -eq 'Window.Resources' } | Select-Object -First 1
+            [xml]$dlgDoc = $dlgMatch.Groups[1].Value.Replace('__RESOURCES__', $res.InnerXml)
+            $dlg = [Windows.Markup.XamlReader]::Load([System.Xml.XmlNodeReader]::new($dlgDoc))
+            $dlgNames = @($dlgDoc.SelectNodes(
+                "//*[@*[local-name()='Name']][not(ancestor::*[local-name()='ControlTemplate'])]") |
+                ForEach-Object { $_.GetAttribute('Name', 'http://schemas.microsoft.com/winfx/2006/xaml') } |
+                Where-Object { $_ })
+            $dlgMissing = @($dlgNames | Where-Object { -not $dlg.FindName($_) })
+            if ($dlgMissing.Count -gt 0) {
+                Write-Host "  ERROR - patch-window dialog, unresolved controls: $($dlgMissing -join ', ')" -ForegroundColor Red
+                $failed = $true
+            } else {
+                Write-Host "  OK - patch-window dialog loads, all $($dlgNames.Count) named controls resolve" -ForegroundColor Green
+            }
+        }
     }
 } catch {
     Write-Host "  ERROR - XAML: $($_.Exception.Message)" -ForegroundColor Red
