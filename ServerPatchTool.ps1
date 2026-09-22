@@ -3865,10 +3865,20 @@ $ui.btnClearLog.Add_Click({
 $window.Add_Closing({
     param($src, $e)
     if (-not $script:PatchWindow) { return }
-    $answer = [System.Windows.MessageBox]::Show(
-        "A patch window is scheduled for $($script:PatchWindow.RebootAt.ToString('dd.MM.yyyy HH:mm')).`n`nClosing the tool means nothing will happen at that time. It will be offered again the next time the tool starts.`n`nClose anyway?",
-        "Patch Window Scheduled",
-        [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning)
+    if ($script:PatchWindow.Phase -eq 'Rebooting') {
+        # The reboots have begun: closing now leaves the queue half done, which
+        # is worse than never starting it.
+        $queued = $script:RebootQueue.Count
+        $text = "The patch window reboot is in progress: $queued more server(s) are queued after the current one.`n`nClosing the tool now stops the queue - they will not be rebooted - and stops watching the server being rebooted, so its check and the final report are lost. A reboot already sent still happens.`n`nThe servers not yet rebooted will be offered again the next time the tool starts.`n`nClose anyway?"
+        $title = "Patch Window In Progress"
+    } else {
+        $text = "A patch window is scheduled for $($script:PatchWindow.RebootAt.ToString('dd.MM.yyyy HH:mm')).`n`nClosing the tool means nothing will happen at that time. It will be offered again the next time the tool starts.`n`nClose anyway?"
+        $title = "Patch Window Scheduled"
+    }
+    # No is the default: a reflexive Enter must not cancel the night's work.
+    $answer = [System.Windows.MessageBox]::Show($text, $title,
+        [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning,
+        [System.Windows.MessageBoxResult]::No)
     if ($answer -ne "Yes") { $e.Cancel = $true }
 })
 
