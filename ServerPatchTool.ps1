@@ -3375,12 +3375,18 @@ function Resume-PatchWindow {
     $when = $saved.RebootAt.ToString('dd.MM.yyyy HH:mm')
     $list = @($saved.Servers) -join ', '
     if ($saved.RebootAt -gt (Get-Date)) {
-        $text = "A patch window was scheduled before the tool was closed:`n`nSequential reboot at $when of those that need it, in this order:`n$list`n`nRestore it?`n`nNo discards it."
+        $text    = "A patch window was scheduled before the tool was closed:`n`nSequential reboot at $when of those that need it, in this order:`n$list`n`nRestore it?`n`nNo discards it."
+        $icon    = [System.Windows.MessageBoxImage]::Question
+        $default = [System.Windows.MessageBoxResult]::Yes
     } else {
-        $text = "A patch window was due at $when, but the tool was not running then.`n`nServers, in order:`n$list`n`nStart the sequential reboot now?`n`nNo discards it."
+        # Yes here takes production servers down there and then, very likely in
+        # working hours - so it is never what a reflexive Enter does.
+        $text    = "A patch window was due at $when, but the tool was not running then.`n`nServers, in order:`n$list`n`nYes starts rebooting the servers that need it IMMEDIATELY, one by one.`n`nNo discards the plan (the default)."
+        $icon    = [System.Windows.MessageBoxImage]::Warning
+        $default = [System.Windows.MessageBoxResult]::No
     }
     $answer = [System.Windows.MessageBox]::Show($text, "Patch Window",
-        [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question)
+        [System.Windows.MessageBoxButton]::YesNo, $icon, $default)
     if ($answer -eq "Yes") {
         $script:PatchWindow = $saved
         Save-PatchWindow
