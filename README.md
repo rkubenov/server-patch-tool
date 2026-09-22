@@ -82,9 +82,24 @@ The scan and the parallel install start straight away, with the usual pre-flight
 
 At the end the log has a report: how many were rebooted, which ones are clean (post-reboot scan `Up to date`, no reboot pending), which need attention (updates still pending, offline, scan failed) and which were skipped, and why.
 
-While a plan is armed, the status bar shows a countdown with a **Cancel** button. Things to know:
+While a plan is armed, the status bar shows a countdown next to a **Cancel** button: `Patch window: waiting - reboot Wed 23.09 02:00 (in 7 h 13 min), 4 of 5 need a reboot`. While the scan and install run it counts the servers in the plan; once they are done it counts the ones that will actually go down, by the same rule the reboot itself applies. During the reboots it reads `sequential reboot in progress`, and Cancel is disabled — **Stop** is what ends a run that has begun.
 
-- **The tool has to stay open.** A locked screen is fine. Logging off, closing the window, or the workstation restarting (watch for its own Windows Update) means nothing happens at the reboot time. Closing asks first.
+### The prompts, and what Enter does
+
+Four prompts belong to a patch window. In all but the first, **No is the default**, so a reflexive Enter never costs a maintenance window:
+
+| When | What it asks | Enter |
+|---|---|---|
+| After **Schedule...** | The whole plan: what starts now, the reboot time, the order, and that the tool must stay open | **Yes** — this is the click that asked for it |
+| **Cancel** next to the countdown | Cancel the plan; scans and installs already started carry on | **No** — the plan stays |
+| Closing the tool with a plan armed | Nothing will happen at the reboot time; it will be offered again at the next start | **No** — the tool stays open |
+| Closing the tool **during** the reboots | How many servers are still queued, and that closing stops the queue, the watch and the report — a reboot already sent still happens | **No** — the tool stays open |
+
+At start-up, a saved plan gets a fifth prompt. If its time is still ahead, it offers to restore the countdown and Enter accepts. If the time has already passed — the workstation restarted overnight, say — the prompt says plainly that **Yes** starts rebooting immediately, one by one, and the default is No.
+
+Other things to know:
+
+- **The tool has to stay open.** A locked screen is fine. Logging off, closing the window, or the workstation restarting (watch for its own Windows Update) means nothing happens at the reboot time.
 - **The plan is saved** to `%LOCALAPPDATA%\ServerPatchTool\patch-window.json`. If the tool was closed, the next start offers to restore it; if the time has already passed, it asks whether to start the reboots now. Scans or installs still in progress when the tool closed are not resumed.
 - **Stop** also cancels the plan, and so does the password guard halting a run.
 - A reboot run started by hand when the time comes is not interrupted. The window waits for it to finish.
@@ -186,7 +201,7 @@ Anything a callback needs to do therefore belongs in a named function. Function 
   - the deferred re-checks that follow an install time-out;
   - the stale-password guard actually halting a run, including how well `Test-AuthFailure` recognises the wording the domain controllers really use - a formulation it does not match simply means the guard stays quiet;
   - holding a KB back, end to end, as far as the server skipping it;
-  - the patch window, end to end: the timed start, the scan-before-next hand-over, and restoring a saved plan. The dialog itself has been driven by a script (reordering, unticking, a bad time refused), but not yet through a real window;
+  - the patch window, end to end: the timed start, the scan-before-next hand-over, and restoring a saved plan. The dialog itself has been driven by a script (reordering, unticking, a bad time refused) and the prompts have been read from screenshots, but neither through a real window. The prompts' default buttons are not covered by the tests;
   - the pre-flight blocking an install. Its 8 GB free-space threshold is an estimate for cumulative updates, not a measured figure for this estate: a server that normally runs closer to the line will start being blocked where it used to install.
 
 
