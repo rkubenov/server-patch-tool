@@ -496,6 +496,9 @@ if (-not (Test-Path -LiteralPath $script:LogDir)) {
                                 ToolTip="Install available updates on ALL servers"/>
                         <Button x:Name="btnRebootAll" Content="Reboot All" Style="{StaticResource DangerButton}"
                                 ToolTip="Reboot ALL servers that require it"/>
+                        <Border Width="1" Background="#45475a" Margin="8,2"/>
+                        <Button x:Name="btnPatchWindow" Content="Patch Window..."
+                                ToolTip="Scan and install now, then reboot one by one at a time you choose - the tool stays open until then; a locked screen is fine"/>
                     </WrapPanel>
                 </DockPanel>
             </StackPanel>
@@ -552,6 +555,15 @@ if (-not (Test-Path -LiteralPath $script:LogDir)) {
                                VerticalAlignment="Center"/>
                 </StackPanel>
                 <StackPanel Grid.Column="1" Orientation="Horizontal">
+                    <!-- Shown only while a patch window is scheduled or running. -->
+                    <StackPanel x:Name="pnlPatchWindow" Orientation="Horizontal" Visibility="Collapsed"
+                                Margin="0,0,16,0">
+                        <TextBlock x:Name="txtPatchWindow" Foreground="#f9e2af" FontSize="12"
+                                   VerticalAlignment="Center"/>
+                        <Button x:Name="btnCancelPatchWindow" Content="Cancel" FontSize="11"
+                                Padding="8,1" Margin="8,0,0,0"
+                                ToolTip="Cancel the scheduled patch window. Work already started is not recalled."/>
+                    </StackPanel>
                     <TextBlock x:Name="txtServerCount" Text="0 servers" Foreground="#a6adc8"
                                FontSize="12" VerticalAlignment="Center" Margin="0,0,16,0"/>
                     <ProgressBar x:Name="progressBar" Width="200" Height="8"
@@ -2007,6 +2019,10 @@ $script:JobTimer.Add_Tick({
 
     Step-PendingRechecks
 
+    # Contained: this runs twice a second, and one bad tick must not take the
+    # job handling above down with it.
+    try { Step-PatchWindow } catch { Write-Log "Patch window: $($_.Exception.Message)" "ERROR" }
+
     # Update progress
     if ($script:ActiveJobs.Count -eq 0) {
         Show-Progress -Visible $false
@@ -2112,9 +2128,15 @@ function Complete-InstallResult {
 # Shared tail for post-reboot monitor jobs. The single, sequential and parallel
 # reboot paths each carried an identical copy of this block, so every fix had
 # to be made in three places.
+#
+# -HandOnAfterScan: the rescan it starts is also what advances the sequential
+# reboot queue (a patch window verifies each server before the next reboot).
+# Returns $true when a scan took that job over, so the caller must not advance
+# the queue itself; $false when no scan was started and the caller should.
 function Complete-RebootMonitor {
-    param([string]$ServerName, $Monitor)
+    param([string]$ServerName, $Monitor, [switch]$HandOnAfterScan)
 
+    $handedOn = $false
     # Neither losing the monitor nor an error inside it proves anything about
     # the server, so both now fall back to the one check that does - a scan.
     # A job that produced no output at all used to land in the default branch
@@ -2133,7 +2155,8 @@ function Complete-RebootMonitor {
             Write-Log "$ServerName : Back online - starting post-reboot scan"
             # -NoProgress: this rescan belongs to the reboot batch that is
             # already being counted, not to a scan batch of its own.
-            Invoke-ScanServer -ServerName $ServerName -NoProgress
+            Invoke-ScanServer -ServerName $ServerName -NoProgress -ThenStepRebootQueue:$HandOnAfterScan
+            $handedOn = [bool]$HandOnAfterScan
         }
         "Timeout" {
             Update-ServerEntry -ServerName $ServerName -Properties @{
@@ -2161,10 +2184,12 @@ function Complete-RebootMonitor {
                 Details = "Lost track of the reboot: $reason. Re-scanning to find out whether the server is back."
             }
             Write-Log "$ServerName : lost track of the reboot - $reason; re-scanning instead" "WARN"
-            Invoke-ScanServer -ServerName $ServerName -NoProgress
+            Invoke-ScanServer -ServerName $ServerName -NoProgress -ThenStepRebootQueue:$HandOnAfterScan
+            $handedOn = [bool]$HandOnAfterScan
         }
     }
     Step-Progress
+    return $handedOn
 }
 
 # Starts the watch that proves a server really came back, and hands the queue on
@@ -2214,12 +2239,16 @@ function Start-RebootMonitor {
     param([string]$ServerName, $BootBefore, [switch]$Sequential)
 
     $monCred = Get-ServerCredential -ServerName $ServerName
+    # Read here, not in the callback: a closure does not see $script: state.
+    $verify = [bool]($Sequential -and $script:RebootVerifyScan)
     Start-AsyncJob -ScriptBlock $script:RebootMonitorScript `
                    -Arguments @($ServerName, $monCred, $BootBefore, (Get-RebootTimeout)) `
                    -OnComplete {
         param($monResult)
-        Complete-RebootMonitor -ServerName $ServerName -Monitor ($monResult | Select-Object -First 1)
-        if ($Sequential) { Step-RebootQueue }
+        $out = @(Complete-RebootMonitor -ServerName $ServerName -Monitor ($monResult | Select-Object -First 1) -HandOnAfterScan:$verify)
+        # When the verifying scan has taken over, it advances the queue once it
+        # is done - doing it here as well would reboot the next server early.
+        if ($Sequential -and -not ($out -contains $true)) { Step-RebootQueue }
     }.GetNewClosure()
 }
 
@@ -2239,7 +2268,12 @@ function Stop-AllOperations {
     $script:RebootQueue.Clear()
     $script:SequentialRunning  = $false
     $script:RebootQueueRunning = $false
+    $script:RebootVerifyScan   = $false
     $script:PendingRechecks.Clear()
+
+    # A schedule left armed after Stop would take servers down at night that
+    # the operator had just asked the tool to leave alone.
+    if ($script:PatchWindow) { Clear-PatchWindow -Reason $Reason }
 
     $stopped = $script:ActiveJobs.Count
     foreach ($job in @($script:ActiveJobs)) {
@@ -2280,9 +2314,15 @@ function Stop-AllOperations {
 }
 
 function Invoke-ScanServer {
-    param([string]$ServerName, [switch]$NoProgress)
+    # -ThenStepRebootQueue: a patch window scans each server after it comes back
+    # and only then takes the next one down, so the scan is what hands the
+    # sequential reboot queue on - whatever the scan finds.
+    param([string]$ServerName, [switch]$NoProgress, [switch]$ThenStepRebootQueue)
 
-    if (-not (Ensure-Credential)) { return }
+    if (-not (Ensure-Credential)) {
+        if ($ThenStepRebootQueue) { Step-RebootQueue -AfterFailure }
+        return
+    }
 
     Update-ServerEntry -ServerName $ServerName -Properties @{
         Status  = "Scanning..."
@@ -2324,6 +2364,7 @@ function Invoke-ScanServer {
             Write-Log "$ServerName : $errMsg" "ERROR"
         }
         if (-not $NoProgress) { Step-Progress }
+        if ($ThenStepRebootQueue) { Step-RebootQueue }
     }.GetNewClosure()
 }
 
@@ -2788,6 +2829,10 @@ $ui.btnInstallAll.Add_Click({
 # -- Sequential Reboot Logic ---------------------------------------------------
 $script:RebootQueue = [System.Collections.Generic.Queue[string]]::new()
 $script:RebootQueueRunning = $false
+# Set by a patch window: each server is scanned after it comes back, and the
+# scan - not the monitor - hands the queue on. Manual sequential reboots keep
+# moving on as soon as the server is back.
+$script:RebootVerifyScan = $false
 
 # Advances the reboot queue. A function for the same reason as
 # Step-SequentialInstallQueue: the callers are closures, and a flag cleared
@@ -2805,9 +2850,11 @@ function Step-RebootQueue {
         Invoke-RebootServerSequential -ServerName $next
     } else {
         $script:RebootQueueRunning = $false
+        $script:RebootVerifyScan   = $false
         Update-StatusBar "Sequential reboot complete"
         Show-Progress -Visible $false
         Write-Log "Sequential reboot queue completed"
+        if ($script:PatchWindow -and $script:PatchWindow.Phase -eq 'Rebooting') { Complete-PatchWindow }
     }
 }
 
@@ -2947,6 +2994,591 @@ $ui.btnRebootAll.Add_Click({
     if (-not (Ensure-Credential)) { return }
     $servers = @($script:ServerData | Where-Object { $_.RebootRequired -eq "Yes" })
     Start-RebootBatch -Servers $servers -Label ""
+})
+
+# -- Patch window -------------------------------------------------------------
+# The routine this automates: the day before, scan and install in parallel; on
+# the night, reboot one server at a time. The first half starts straight away.
+# The second is held by the job timer until the chosen time, so the tool has to
+# stay open until then - a locked screen is fine, a logged-off session is not.
+#
+# Phases: Scanning -> Installing -> Waiting -> Rebooting. A plan made without
+# the scan-and-install step starts at Waiting. Reaching the reboot time moves
+# any phase on to Rebooting; servers still busy at that point are skipped.
+$script:PatchWindow     = $null
+$script:PatchWindowFile = Join-Path $script:CredDir "patch-window.json"
+
+# Statuses that mean a server is in the middle of something and must not be
+# rebooted underneath it.
+$script:PatchWindowBusy = @("Scanning...", "Checking...", "Installing...", "Still installing", "Rebooting...")
+
+# Validates what the dialog collected and turns it into a plan. Pure, so the
+# rules can be tested without a window.
+function New-PatchWindowPlan {
+    param(
+        [datetime]$Day,
+        [string]$TimeText,
+        [string[]]$Servers,
+        [bool]$Prepare,
+        [datetime]$Now = (Get-Date)
+    )
+    $fail = { param($Why) [PSCustomObject]@{ Ok = $false; Error = $Why; Plan = $null } }
+
+    $time = [datetime]::MinValue
+    $formats = [string[]]@('H:mm', 'HH:mm', 'H.mm', 'HH.mm')
+    if (-not [datetime]::TryParseExact("$TimeText".Trim(), $formats,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::None, [ref]$time)) {
+        return (& $fail "'$TimeText' is not a time. Use 24-hour HH:mm, for example 02:00.")
+    }
+    $at = $Day.Date.Add($time.TimeOfDay)
+    if ($at -le $Now) {
+        return (& $fail "The reboot time $($at.ToString('dd.MM HH:mm')) has already passed.")
+    }
+
+    # Order is the whole point of the list, so it is kept exactly; a name that
+    # appears twice is only rebooted once.
+    $list = New-Object System.Collections.Generic.List[string]
+    foreach ($s in @($Servers)) {
+        if ($s -and -not $list.Contains($s)) { $list.Add($s) | Out-Null }
+    }
+    if ($list.Count -eq 0) {
+        return (& $fail "No servers are included.")
+    }
+
+    $plan = [PSCustomObject]@{
+        RebootAt   = $at
+        Servers    = [string[]]$list.ToArray()
+        Prepare    = $Prepare
+        Phase      = if ($Prepare) { 'Scanning' } else { 'Waiting' }
+        CreatedAt  = $Now
+        Queued     = @()
+        Skipped    = @()
+        WaitLogged = $false
+    }
+    return [PSCustomObject]@{ Ok = $true; Error = $null; Plan = $plan }
+}
+
+# Which of the plan's servers to reboot, in the plan's order. Decided at the
+# reboot time rather than when planning, because the install in between is what
+# decides it.
+function Get-PatchWindowRebootList {
+    param([string[]]$Servers)
+
+    $reboot  = New-Object System.Collections.Generic.List[string]
+    $skipped = New-Object System.Collections.Generic.List[PSObject]
+    foreach ($name in @($Servers)) {
+        $entry = $script:ServerData | Where-Object { $_.ServerName -eq $name } | Select-Object -First 1
+        $why = $null
+        if (-not $entry) {
+            $why = "no longer in the server list"
+        } elseif ($entry.Status -in $script:PatchWindowBusy) {
+            $why = "still busy ($($entry.Status))"
+        } elseif ($entry.RebootRequired -ne "Yes") {
+            $why = "no reboot needed"
+        }
+        if ($why) {
+            $skipped.Add([PSCustomObject]@{ ServerName = $name; Reason = $why }) | Out-Null
+        } else {
+            $reboot.Add($name) | Out-Null
+        }
+    }
+    return [PSCustomObject]@{
+        Reboot  = [string[]]$reboot.ToArray()
+        Skipped = [PSObject[]]$skipped.ToArray()
+    }
+}
+
+function Test-PatchWindowBusy {
+    param([string[]]$Statuses)
+    $pw = $script:PatchWindow
+    if (-not $pw) { return $false }
+    foreach ($name in $pw.Servers) {
+        $entry = $script:ServerData | Where-Object { $_.ServerName -eq $name } | Select-Object -First 1
+        if ($entry -and $entry.Status -in $Statuses) { return $true }
+    }
+    return $false
+}
+
+# "in 3 h 12 min". Pure, for the banner and the tests.
+function Format-PatchWindowCountdown {
+    param([TimeSpan]$Left)
+    if ($Left.TotalMinutes -lt 1) { return "in under a minute" }
+    if ($Left.TotalDays -ge 1)    { return "in $([int][Math]::Floor($Left.TotalDays)) d $($Left.Hours) h" }
+    if ($Left.TotalHours -ge 1)   { return "in $([int][Math]::Floor($Left.TotalHours)) h $($Left.Minutes) min" }
+    return "in $([int][Math]::Ceiling($Left.TotalMinutes)) min"
+}
+
+function Get-PatchWindowBannerText {
+    param($Window, [datetime]$Now = (Get-Date))
+    if (-not $Window) { return "" }
+    $n = @($Window.Servers).Count
+    if ($Window.Phase -eq 'Rebooting') {
+        return "Patch window: sequential reboot in progress ($(@($Window.Queued).Count) server(s))"
+    }
+    $doing = switch ($Window.Phase) {
+        'Scanning'   { "scanning" }
+        'Installing' { "installing" }
+        default      { "waiting" }
+    }
+    $left = Format-PatchWindowCountdown -Left ($Window.RebootAt - $Now)
+    return "Patch window: $doing - reboot $($Window.RebootAt.ToString('ddd dd.MM HH:mm')) ($left), $n server(s)"
+}
+
+function Update-PatchWindowBanner {
+    param([datetime]$Now = (Get-Date))
+    $pw   = $script:PatchWindow
+    $text = Get-PatchWindowBannerText -Window $pw -Now $Now
+    if ($ui.txtPatchWindow.Text -ne $text) { $ui.txtPatchWindow.Text = $text }
+    $ui.pnlPatchWindow.Visibility = if ($pw) { "Visible" } else { "Collapsed" }
+    # Once the reboots have begun, Stop is the control that ends them.
+    $ui.btnCancelPatchWindow.IsEnabled = [bool]($pw -and $pw.Phase -ne 'Rebooting')
+}
+
+# What the operator is asked to confirm. Spelled out in full, order included,
+# because this is the last look anyone takes before the night.
+function Get-PatchWindowSummary {
+    param($Plan)
+    $n     = @($Plan.Servers).Count
+    $lines = New-Object System.Collections.Generic.List[string]
+    if ($Plan.Prepare) {
+        $lines.Add("Now: scan the $n server(s) below, then install updates on them in parallel.") | Out-Null
+    } else {
+        $lines.Add("Nothing is started now - the scan and install are assumed done.") | Out-Null
+    }
+    $lines.Add("") | Out-Null
+    $lines.Add("At $($Plan.RebootAt.ToString('dddd dd.MM.yyyy HH:mm')): reboot one by one, in this order, the ones that need a reboot by then:") | Out-Null
+    $shown = [Math]::Min($n, 25)
+    for ($i = 0; $i -lt $shown; $i++) { $lines.Add("  $($i + 1). $($Plan.Servers[$i])") | Out-Null }
+    if ($n -gt $shown) { $lines.Add("  ... and $($n - $shown) more") | Out-Null }
+    $lines.Add("") | Out-Null
+    $lines.Add("After each reboot the server is scanned before the next one goes down. A server that fails to reboot or come back is logged and the queue moves on.") | Out-Null
+    $lines.Add("") | Out-Null
+    $lines.Add("Keep this window open until then. Locking the screen is fine; logging off or closing the tool stops the plan.") | Out-Null
+    return ($lines -join "`n")
+}
+
+function Save-PatchWindow {
+    $pw = $script:PatchWindow
+    try {
+        if (-not $pw) {
+            if (Test-Path -LiteralPath $script:PatchWindowFile) {
+                Remove-Item -LiteralPath $script:PatchWindowFile -Force -ErrorAction SilentlyContinue
+            }
+            return
+        }
+        if (-not (Test-Path -LiteralPath $script:CredDir)) {
+            New-Item -ItemType Directory -Path $script:CredDir -Force | Out-Null
+        }
+        # Dates as round-trip text: Windows PowerShell's JSON has no date type,
+        # and a local time written without its offset reads back ambiguous.
+        ConvertTo-Json -Depth 3 -InputObject @{
+            RebootAt  = $pw.RebootAt.ToString('o')
+            Servers   = @($pw.Servers)
+            Phase     = $pw.Phase
+            CreatedAt = $pw.CreatedAt.ToString('o')
+        } | Set-Content -Path $script:PatchWindowFile -Encoding UTF8 -Force
+    } catch {
+        Write-Log "Could not save the patch window: $($_.Exception.Message)" "WARN"
+    }
+}
+
+# The plan saved by an earlier session, or $null. It always comes back as
+# Waiting: whatever scans or installs it had started died with that session.
+function Read-PatchWindow {
+    if (-not (Test-Path -LiteralPath $script:PatchWindowFile)) { return $null }
+    try {
+        $raw = Get-Content -LiteralPath $script:PatchWindowFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        # Only a time that says it is UTC is converted. ToLocalTime() treats a
+        # time with no zone as UTC too, and would move a plan made on this
+        # clock by the local offset - five hours here.
+        $toDate = { param($v)
+            $d = if ($v -is [datetime]) { $v } else {
+                [datetime]::Parse([string]$v, [Globalization.CultureInfo]::InvariantCulture,
+                                  [Globalization.DateTimeStyles]::RoundtripKind) }
+            if ($d.Kind -eq [DateTimeKind]::Utc) { $d.ToLocalTime() } else { $d } }
+        $servers = @(@($raw.Servers) | Where-Object { $_ } | ForEach-Object { [string]$_ })
+        if ($servers.Count -eq 0) { throw "it lists no servers" }
+        return [PSCustomObject]@{
+            RebootAt   = (& $toDate $raw.RebootAt)
+            Servers    = [string[]]$servers
+            Prepare    = $false
+            Phase      = 'Waiting'
+            CreatedAt  = (& $toDate $raw.CreatedAt)
+            Queued     = @()
+            Skipped    = @()
+            WaitLogged = $false
+        }
+    } catch {
+        Write-Log "The saved patch window could not be read and was ignored: $($_.Exception.Message)" "WARN"
+        return $null
+    }
+}
+
+function Clear-PatchWindow {
+    param([string]$Reason = "Cancelled by user")
+    if (-not $script:PatchWindow) { return }
+    $at = $script:PatchWindow.RebootAt.ToString('dd.MM HH:mm')
+    $script:PatchWindow = $null
+    Save-PatchWindow
+    Update-PatchWindowBanner
+    Write-Log "Patch window for $at cancelled: $Reason" "WARN"
+}
+
+function Start-PatchWindow {
+    param($Plan)
+    $script:PatchWindow = $Plan
+    Save-PatchWindow
+    Write-Log "Patch window set: sequential reboot at $($Plan.RebootAt.ToString('dd.MM.yyyy HH:mm')) - order: $(@($Plan.Servers) -join ', ')"
+
+    if ($Plan.Prepare) {
+        Sync-RunspacePool
+        Start-ProgressBatch -Total @($Plan.Servers).Count
+        Update-StatusBar "Patch window: scanning $(@($Plan.Servers).Count) server(s)..."
+        Write-Log "Patch window: scanning $(@($Plan.Servers).Count) server(s) before the install"
+        foreach ($name in $Plan.Servers) { Invoke-ScanServer -ServerName $name }
+    }
+    Update-PatchWindowBanner
+}
+
+function Start-PatchWindowInstall {
+    $pw = $script:PatchWindow
+    $pw.Phase = 'Installing'
+    Save-PatchWindow
+
+    $targets = @($pw.Servers | Where-Object {
+        $name  = $_
+        $entry = $script:ServerData | Where-Object { $_.ServerName -eq $name } | Select-Object -First 1
+        $entry -and $entry.Status -like "Available*"
+    })
+    if ($targets.Count -eq 0) {
+        Write-Log "Patch window: scan finished - nothing to install"
+        return
+    }
+    Sync-RunspacePool
+    Start-ProgressBatch -Total $targets.Count
+    Update-StatusBar "Patch window: installing on $($targets.Count) server(s) in parallel..."
+    Write-Log "Patch window: scan finished - installing on $($targets.Count) server(s) in parallel"
+    foreach ($name in $targets) { Invoke-InstallServer -ServerName $name }
+}
+
+function Start-PatchWindowReboot {
+    $pw = $script:PatchWindow
+
+    # A run started by hand is not cut short. The reboot waits for it, and says
+    # so once rather than on every tick.
+    if ($script:SequentialRunning -or $script:RebootQueueRunning) {
+        if (-not $pw.WaitLogged) {
+            Write-Log "Patch window: reboot time reached, but a sequential run is still going - waiting for it to finish" "WARN"
+            $pw.WaitLogged = $true
+        }
+        return
+    }
+
+    $pick = Get-PatchWindowRebootList -Servers $pw.Servers
+    $pw.Queued  = $pick.Reboot
+    $pw.Skipped = $pick.Skipped
+    $pw.Phase   = 'Rebooting'
+    Save-PatchWindow
+
+    foreach ($s in $pick.Skipped) {
+        Write-Log "Patch window: not rebooting $($s.ServerName) - $($s.Reason)"
+    }
+    if ($pick.Reboot.Count -eq 0) {
+        Write-Log "Patch window: reboot time reached - no server needs a reboot"
+        Complete-PatchWindow
+        return
+    }
+
+    Sync-RunspacePool
+    Start-ProgressBatch -Total $pick.Reboot.Count
+    $script:RebootQueue.Clear()
+    foreach ($name in $pick.Reboot) { $script:RebootQueue.Enqueue($name) }
+    $script:RebootQueueRunning = $true
+    $script:RebootVerifyScan   = $true
+
+    Write-Log "Patch window: starting sequential reboot of $($pick.Reboot.Count) server(s): $($pick.Reboot -join ', ')"
+    $first = $script:RebootQueue.Dequeue()
+    Update-StatusBar "Rebooting $first... ($($script:RebootQueue.Count) remaining in queue)"
+    Invoke-RebootServerSequential -ServerName $first
+}
+
+# The morning report. A server counts as clean only when its post-reboot scan
+# says so; anything else - still pending updates, offline, a failed scan - is
+# listed with what the grid says about it.
+function Complete-PatchWindow {
+    $pw = $script:PatchWindow
+    if (-not $pw) { return }
+
+    $clean     = @()
+    $attention = @()
+    foreach ($name in @($pw.Queued)) {
+        $entry = $script:ServerData | Where-Object { $_.ServerName -eq $name } | Select-Object -First 1
+        if ($entry -and $entry.Status -eq "Up to date" -and $entry.RebootRequired -eq "No") {
+            $clean += $name
+        } else {
+            $state  = if ($entry) { $entry.Status } else { "no longer in the list" }
+            $detail = if ($entry -and $entry.Details) { [string]$entry.Details } else { "" }
+            if ($detail.Length -gt 200) { $detail = $detail.Substring(0, 200) + "..." }
+            $attention += "$name : $state$(if ($detail) { " - $detail" })"
+        }
+    }
+
+    $summary = "Patch window finished: $(@($pw.Queued).Count) rebooted, $($clean.Count) clean, $($attention.Count) need attention, $(@($pw.Skipped).Count) skipped"
+    Write-Log $summary $(if ($attention.Count -gt 0) { "WARN" } else { "INFO" })
+    foreach ($a in $attention) { Write-Log "  needs attention - $a" "WARN" }
+    foreach ($s in @($pw.Skipped)) { Write-Log "  skipped - $($s.ServerName) : $($s.Reason)" }
+    Update-StatusBar $summary
+
+    $script:PatchWindow = $null
+    Save-PatchWindow
+    Save-ServerList
+    Update-PatchWindowBanner
+}
+
+# Driven by the job timer.
+function Step-PatchWindow {
+    param([datetime]$Now = (Get-Date))
+    $pw = $script:PatchWindow
+    if (-not $pw) { return }
+
+    if ($pw.Phase -ne 'Rebooting') {
+        if ($Now -ge $pw.RebootAt) {
+            Start-PatchWindowReboot
+        } elseif ($pw.Phase -eq 'Scanning') {
+            if (-not (Test-PatchWindowBusy -Statuses @("Scanning..."))) { Start-PatchWindowInstall }
+        } elseif ($pw.Phase -eq 'Installing') {
+            # Scanning counts too: a clean install is confirmed by a rescan.
+            if (-not (Test-PatchWindowBusy -Statuses @("Checking...", "Installing...", "Scanning..."))) {
+                $pw.Phase = 'Waiting'
+                Save-PatchWindow
+                $need = @((Get-PatchWindowRebootList -Servers $pw.Servers).Reboot).Count
+                Write-Log "Patch window: install finished - $need server(s) need a reboot; sequential reboot at $($pw.RebootAt.ToString('dd.MM HH:mm'))"
+                Update-StatusBar "Patch window: install finished - waiting for $($pw.RebootAt.ToString('dd.MM HH:mm'))"
+            }
+        }
+    }
+    Update-PatchWindowBanner -Now $Now
+}
+
+# Offered once at start-up when an earlier session left a plan behind.
+function Resume-PatchWindow {
+    $saved = Read-PatchWindow
+    if (-not $saved) { return }
+
+    $when = $saved.RebootAt.ToString('dd.MM.yyyy HH:mm')
+    $list = @($saved.Servers) -join ', '
+    if ($saved.RebootAt -gt (Get-Date)) {
+        $text = "A patch window was scheduled before the tool was closed:`n`nSequential reboot at $when of those that need it, in this order:`n$list`n`nRestore it?`n`nNo discards it."
+    } else {
+        $text = "A patch window was due at $when, but the tool was not running then.`n`nServers, in order:`n$list`n`nStart the sequential reboot now?`n`nNo discards it."
+    }
+    $answer = [System.Windows.MessageBox]::Show($text, "Patch Window",
+        [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question)
+    if ($answer -eq "Yes") {
+        $script:PatchWindow = $saved
+        Save-PatchWindow
+        Write-Log "Patch window restored: sequential reboot at $when - order: $list"
+        Update-PatchWindowBanner
+    } else {
+        Remove-Item -LiteralPath $script:PatchWindowFile -Force -ErrorAction SilentlyContinue
+        Write-Log "Saved patch window for $when discarded"
+    }
+}
+
+$script:PatchWindowXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Patch Window" Width="560" Height="620" MinWidth="460" MinHeight="480"
+        WindowStartupLocation="CenterOwner" ResizeMode="CanResizeWithGrip"
+        Background="#1e1e2e" Foreground="#cdd6f4" FontSize="13">
+    <Window.Resources>__RESOURCES__</Window.Resources>
+    <Grid Margin="16">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <TextBlock Grid.Row="0" TextWrapping="Wrap" Foreground="#a6adc8" Margin="0,0,0,10"
+                   Text="Scan and install now in parallel, then reboot one by one at the time below. Only servers that need a reboot by then are rebooted; each is scanned after it comes back, before the next one goes down."/>
+
+        <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,0,0,6">
+            <TextBlock Text="Servers:" Foreground="#a6adc8" VerticalAlignment="Center" Margin="0,0,8,0"/>
+            <RadioButton x:Name="rbPwAll" Content="All" IsChecked="True" Foreground="#cdd6f4"
+                         VerticalContentAlignment="Center" Margin="0,0,12,0"/>
+            <RadioButton x:Name="rbPwSelected" Content="Selected" Foreground="#cdd6f4"
+                         VerticalContentAlignment="Center"/>
+        </StackPanel>
+
+        <Grid Grid.Row="2" Margin="0,0,0,10">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <ListBox x:Name="lbPwServers" Grid.Column="0" Background="#181825" Foreground="#cdd6f4"
+                     BorderBrush="#45475a">
+                <ListBox.ItemTemplate>
+                    <DataTemplate>
+                        <StackPanel Orientation="Horizontal">
+                            <CheckBox IsChecked="{Binding Include, Mode=TwoWay}" VerticalAlignment="Center"
+                                      Margin="0,0,6,0" ToolTip="Untick to leave this server out of the window"/>
+                            <TextBlock Text="{Binding Position}" Width="30" Foreground="#6c7086"/>
+                            <TextBlock Text="{Binding ServerName}" Width="170"/>
+                            <TextBlock Text="{Binding Hint}" Foreground="#6c7086"/>
+                        </StackPanel>
+                    </DataTemplate>
+                </ListBox.ItemTemplate>
+            </ListBox>
+            <StackPanel Grid.Column="1" Margin="8,0,0,0">
+                <Button x:Name="btnPwUp" Content="Up" ToolTip="Reboot the highlighted server earlier"/>
+                <Button x:Name="btnPwDown" Content="Down" ToolTip="Reboot the highlighted server later"/>
+            </StackPanel>
+        </Grid>
+
+        <CheckBox Grid.Row="3" x:Name="chkPwPrepare" IsChecked="True" Margin="0,0,0,10"
+                  Content="Scan and install now (parallel)"
+                  ToolTip="Untick if the install has already been done and only the reboots are left"/>
+
+        <StackPanel Grid.Row="4" Orientation="Horizontal" Margin="0,0,0,6">
+            <TextBlock Text="Reboot on:" Foreground="#a6adc8" VerticalAlignment="Center" Margin="0,0,8,0"/>
+            <ComboBox x:Name="cboPwDay" Width="170" VerticalAlignment="Center"/>
+            <TextBlock Text="at" Foreground="#a6adc8" VerticalAlignment="Center" Margin="10,0,8,0"/>
+            <TextBox x:Name="txtPwTime" Width="70" Text="02:00" VerticalContentAlignment="Center"
+                     ToolTip="24-hour time on this computer's clock, e.g. 02:00"/>
+        </StackPanel>
+
+        <TextBlock Grid.Row="5" x:Name="txtPwError" Foreground="#f38ba8" TextWrapping="Wrap" Margin="0,0,0,6"/>
+
+        <StackPanel Grid.Row="6" Orientation="Horizontal" HorizontalAlignment="Right">
+            <Button x:Name="btnPwOk" Content="Schedule..." Style="{StaticResource AccentButton}" IsDefault="True"/>
+            <Button x:Name="btnPwCancel" Content="Cancel" IsCancel="True"/>
+        </StackPanel>
+    </Grid>
+</Window>
+'@
+
+# Collects a plan. Returns it, or $null if the operator backed out.
+function Show-PatchWindowDialog {
+    # The dialog wears the main window's styles. They are copied in as text:
+    # a StaticResource has to resolve while the XAML is being parsed.
+    $resources = $xaml.DocumentElement.ChildNodes |
+        Where-Object { $_.LocalName -eq 'Window.Resources' } | Select-Object -First 1
+    [xml]$dx = $script:PatchWindowXaml.Replace('__RESOURCES__', $resources.InnerXml)
+    $dlg = [Windows.Markup.XamlReader]::Load([System.Xml.XmlNodeReader]::new($dx))
+    $dlg.Owner = $window
+
+    $c = @{}
+    foreach ($n in 'rbPwAll', 'rbPwSelected', 'lbPwServers', 'btnPwUp', 'btnPwDown',
+                   'chkPwPrepare', 'cboPwDay', 'txtPwTime', 'txtPwError', 'btnPwOk', 'btnPwCancel') {
+        $c[$n] = $dlg.FindName($n)
+    }
+
+    # Snapshots taken here, outside the handlers: those are closures and do not
+    # see $script: state.
+    $all      = @($script:ServerData)
+    $selected = @($script:ServerData | Where-Object { $_.Selected })
+    $items    = [System.Collections.ObjectModel.ObservableCollection[PSObject]]::new()
+    $state    = @{ Plan = $null }
+    $c.lbPwServers.ItemsSource = $items
+
+    $renumber = {
+        param([int]$Keep = -1)
+        for ($i = 0; $i -lt $items.Count; $i++) { $items[$i].Position = "$($i + 1)." }
+        $c.lbPwServers.Items.Refresh()
+        if ($Keep -ge 0) { $c.lbPwServers.SelectedIndex = $Keep }
+    }.GetNewClosure()
+
+    $fill = {
+        $items.Clear()
+        $src = if ($c.rbPwSelected.IsChecked) { $selected } else { $all }
+        foreach ($s in $src) {
+            $items.Add([PSCustomObject]@{
+                Include    = $true
+                Position   = ""
+                ServerName = $s.ServerName
+                Hint       = "$($s.Status), reboot: $($s.RebootRequired)"
+            })
+        }
+        & $renumber
+    }.GetNewClosure()
+
+    $today = (Get-Date).Date
+    for ($d = 0; $d -le 7; $d++) {
+        $day  = $today.AddDays($d)
+        $note = if ($d -eq 0) { " (today)" } elseif ($d -eq 1) { " (tomorrow)" } else { "" }
+        $item = New-Object System.Windows.Controls.ComboBoxItem
+        $item.Content = $day.ToString('ddd dd.MM.yyyy') + $note
+        $item.Tag     = $day
+        $c.cboPwDay.Items.Add($item) | Out-Null
+    }
+    $c.cboPwDay.SelectedIndex = 1
+
+    if ($selected.Count -gt 0 -and $selected.Count -lt $all.Count) { $c.rbPwSelected.IsChecked = $true }
+    & $fill
+    $c.rbPwAll.Add_Checked($fill)
+    $c.rbPwSelected.Add_Checked($fill)
+
+    $c.btnPwUp.Add_Click({
+        $i = $c.lbPwServers.SelectedIndex
+        if ($i -gt 0) { $items.Move($i, $i - 1); & $renumber ($i - 1) }
+    }.GetNewClosure())
+    $c.btnPwDown.Add_Click({
+        $i = $c.lbPwServers.SelectedIndex
+        if ($i -ge 0 -and $i -lt $items.Count - 1) { $items.Move($i, $i + 1); & $renumber ($i + 1) }
+    }.GetNewClosure())
+
+    $c.btnPwOk.Add_Click({
+        $names = @($items | Where-Object { $_.Include } | ForEach-Object { $_.ServerName })
+        $r = New-PatchWindowPlan -Day $c.cboPwDay.SelectedItem.Tag -TimeText $c.txtPwTime.Text `
+                                 -Servers $names -Prepare ([bool]$c.chkPwPrepare.IsChecked)
+        if (-not $r.Ok) { $c.txtPwError.Text = $r.Error; return }
+        $state.Plan = $r.Plan
+        $dlg.DialogResult = $true
+    }.GetNewClosure())
+
+    if ($dlg.ShowDialog()) { return $state.Plan }
+    return $null
+}
+
+$ui.btnPatchWindow.Add_Click({
+    if (-not (Ensure-Credential)) { return }
+    if ($script:PatchWindow) {
+        [System.Windows.MessageBox]::Show(
+            "A patch window is already scheduled for $($script:PatchWindow.RebootAt.ToString('dd.MM.yyyy HH:mm')).`n`nCancel it first - the Cancel button is next to the countdown at the bottom.",
+            "Patch Window", "OK", "Information") | Out-Null
+        return
+    }
+    if ($script:SequentialRunning -or $script:RebootQueueRunning) {
+        [System.Windows.MessageBox]::Show(
+            "A sequential run is still in progress. Wait for it to finish before planning a patch window.",
+            "Busy", "OK", "Information") | Out-Null
+        return
+    }
+    if ($script:ServerData.Count -eq 0) { return }
+
+    $plan = Show-PatchWindowDialog
+    if (-not $plan) { return }
+
+    $confirm = [System.Windows.MessageBox]::Show(
+        (Get-PatchWindowSummary -Plan $plan), "Confirm Patch Window",
+        [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning)
+    if ($confirm -ne "Yes") { return }
+
+    Start-PatchWindow -Plan $plan
+})
+
+$ui.btnCancelPatchWindow.Add_Click({
+    if (-not $script:PatchWindow) { return }
+    $confirm = [System.Windows.MessageBox]::Show(
+        "Cancel the patch window for $($script:PatchWindow.RebootAt.ToString('dd.MM.yyyy HH:mm'))?`n`nNo server will be rebooted by it. Scans or installs it has already started carry on.",
+        "Cancel Patch Window",
+        [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question)
+    if ($confirm -eq "Yes") { Clear-PatchWindow }
 })
 
 # Export CSV
@@ -3189,6 +3821,18 @@ $ui.btnClearLog.Add_Click({
 })
 
 # -- Cleanup on close ---------------------------------------------------------
+# Closing is the one thing that silently kills a scheduled patch window, so it
+# is asked about. The plan stays on disk and is offered again at the next start.
+$window.Add_Closing({
+    param($src, $e)
+    if (-not $script:PatchWindow) { return }
+    $answer = [System.Windows.MessageBox]::Show(
+        "A patch window is scheduled for $($script:PatchWindow.RebootAt.ToString('dd.MM.yyyy HH:mm')).`n`nClosing the tool means nothing will happen at that time. It will be offered again the next time the tool starts.`n`nClose anyway?",
+        "Patch Window Scheduled",
+        [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning)
+    if ($answer -ne "Yes") { $e.Cancel = $true }
+})
+
 $window.Add_Closed({
     Save-ServerList
     $script:JobTimer.Stop()
@@ -3223,11 +3867,14 @@ if (Load-Credentials) {
 
 # Prompt for credentials on startup, but only if nothing was restored.
 $window.Add_ContentRendered({
-    if ($script:Credentials.Count -gt 0) { return }
-    $result = Add-CredentialSet -Message "Enter primary credentials for server management (domain\username)`nYou can add more credentials later for other domains."
-    if (-not $result) {
-        Write-Log "No credentials provided. Add credentials via Credentials > Add Credential." "WARN"
+    if ($script:Credentials.Count -eq 0) {
+        $result = Add-CredentialSet -Message "Enter primary credentials for server management (domain\username)`nYou can add more credentials later for other domains."
+        if (-not $result) {
+            Write-Log "No credentials provided. Add credentials via Credentials > Add Credential." "WARN"
+        }
     }
+    # After the credentials, which a restored plan will need.
+    Resume-PatchWindow
 })
 
 $window.ShowDialog() | Out-Null

@@ -45,6 +45,10 @@
      15. Install pre-flight   - a full disk or a disabled update agent must
                                  stop the install, a pending reboot must not,
                                  and a failed check must never read as a pass.
+     16. Patch window         - the right servers are rebooted, in the
+                                 operator's order, one at a time with a scan
+                                 in between, at the chosen time; the plan
+                                 survives a restart and Stop disarms it.
 
     Not covered: anything that talks to a live server, and the UI event
     handlers whose logic still sits inside the handler itself.
@@ -136,6 +140,8 @@ function Step-PendingRechecks { }
 # down; here it only has to exist, so the tick can be tested on its own terms.
 function Register-JobAuthOutcome { param($Result) }
 function Step-AuthLockdown { }
+# Likewise the patch window, which the tick drives; tested in its own section.
+function Step-PatchWindow { }
 
 function Get-LoggedLike { param([string]$Pattern) @($script:Logged | Where-Object { $_ -like $Pattern }) }
 
@@ -1202,6 +1208,455 @@ Reset-Preflight
 $ok = Complete-InstallPreflight -ServerName 'srv-pending' -Sequential $false -Result (New-Facts -RebootPending $true)
 Check "the install still started"              ($ok -eq $true)
 Check "the pending reboot is in the log"       ((Get-LoggedLike 'WARN|*reboot is already pending*').Count -eq 1)
+
+
+# =============================================================================
+Section "Patch window"
+# The night reboot used to need someone at the keyboard at the right minute. A
+# plan holds it until then, which is only worth having if it reboots the right
+# servers, in the operator's order, one at a time with a scan in between, and
+# says in the morning what happened.
+# =============================================================================
+Invoke-Expression (Get-AssignmentText -VariablePath '$script:PatchWindowBusy')
+foreach ($fn in 'New-PatchWindowPlan', 'Get-PatchWindowRebootList', 'Test-PatchWindowBusy',
+                'Format-PatchWindowCountdown', 'Get-PatchWindowBannerText', 'Get-PatchWindowSummary',
+                'Save-PatchWindow', 'Read-PatchWindow', 'Clear-PatchWindow', 'Start-PatchWindowInstall',
+                'Start-PatchWindowReboot', 'Complete-PatchWindow', 'Step-PatchWindow') {
+    Invoke-Expression (Get-FunctionText -Name $fn)
+}
+
+$pwDir = Join-Path $env:TEMP ("spt-tests-" + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $pwDir -Force | Out-Null
+$script:CredDir         = $pwDir
+$script:PatchWindowFile = Join-Path $pwDir 'patch-window.json'
+
+$script:Installed     = @()
+$script:RebootStarted = @()
+function Update-PatchWindowBanner { param([datetime]$Now) }
+function Save-ServerList { }
+function Sync-RunspacePool { }
+function Start-ProgressBatch { param([int]$Total) }
+function Invoke-InstallServer { param([string]$ServerName) $script:Installed += $ServerName }
+function Invoke-RebootServerSequential { param([string]$ServerName) $script:RebootStarted += $ServerName }
+
+# Rows are name, status, reboot flag[, details].
+function Set-PwGrid {
+    param([object[]]$Rows)
+    $script:ServerData = [System.Collections.ObjectModel.ObservableCollection[PSObject]]::new()
+    foreach ($r in $Rows) {
+        $script:ServerData.Add([PSCustomObject]@{
+            ServerName = $r[0]; Status = $r[1]; RebootRequired = $r[2]
+            Details    = if ($r.Count -gt 3) { $r[3] } else { "" }
+        })
+    }
+}
+function Set-PwRow {
+    param([string]$Name, [string]$Status, [string]$Reboot)
+    $row = $script:ServerData | Where-Object { $_.ServerName -eq $Name }
+    $row.Status = $Status
+    if ($Reboot) { $row.RebootRequired = $Reboot }
+}
+function Reset-Pw {
+    $script:Logged = @(); $script:Installed = @(); $script:RebootStarted = @()
+    $script:RebootQueue.Clear()
+    $script:RebootQueueRunning = $false
+    $script:SequentialRunning  = $false
+    $script:RebootVerifyScan   = $false
+    $script:PatchWindow        = $null
+    Remove-Item -LiteralPath $script:PatchWindowFile -Force -ErrorAction SilentlyContinue
+}
+
+$pwNow = [datetime]'2030-01-01 12:00'
+$pwDay = [datetime]'2030-01-02'
+function New-TestPlan {
+    param([string[]]$Servers, [bool]$Prepare = $false)
+    (New-PatchWindowPlan -Day $pwDay -TimeText '02:00' -Servers $Servers -Prepare $Prepare -Now $pwNow).Plan
+}
+$pwAt = $pwDay.AddHours(2)
+
+Case "a plan keeps the operator's order, and a name given twice once"
+$r = New-PatchWindowPlan -Day $pwDay -TimeText '02:00' -Servers @('SRV-C','SRV-A','SRV-B','SRV-A') -Prepare $true -Now $pwNow
+Check "it is accepted"                         ($r.Ok)
+Check "the reboot time is the day plus the time" ($r.Plan.RebootAt -eq $pwAt)
+Check "the order is kept exactly"              (($r.Plan.Servers -join ',') -eq 'SRV-C,SRV-A,SRV-B')
+Check "with the install step it starts by scanning" ($r.Plan.Phase -eq 'Scanning')
+
+Case "without the install step it only waits"
+Check "the phase is Waiting"                   ((New-TestPlan -Servers @('SRV-A')).Phase -eq 'Waiting')
+
+Case "one server is still a list of one"
+$p = New-TestPlan -Servers @('SRV-A')
+Check "one server, not its letters"            ((@($p.Servers).Count -eq 1) -and ($p.Servers[0] -eq 'SRV-A'))
+
+Case "a time with a dot is read too"
+$r = New-PatchWindowPlan -Day $pwDay -TimeText ' 2.30 ' -Servers @('SRV-A') -Prepare $false -Now $pwNow
+Check "02:30 was understood"                   ($r.Ok -and $r.Plan.RebootAt -eq $pwDay.AddMinutes(150))
+
+Case "input that cannot be right is refused, with a reason"
+$r = New-PatchWindowPlan -Day $pwDay -TimeText '25:00' -Servers @('SRV-A') -Prepare $false -Now $pwNow
+Check "an impossible time is refused"          ((-not $r.Ok) -and ($r.Error -match 'not a time'))
+$r = New-PatchWindowPlan -Day $pwDay -TimeText '2am' -Servers @('SRV-A') -Prepare $false -Now $pwNow
+Check "a time that is not HH:mm is refused"    (-not $r.Ok)
+$r = New-PatchWindowPlan -Day $pwNow.Date -TimeText '11:00' -Servers @('SRV-A') -Prepare $false -Now $pwNow
+Check "a time already gone is refused"         ((-not $r.Ok) -and ($r.Error -match 'already passed'))
+$r = New-PatchWindowPlan -Day $pwDay -TimeText '02:00' -Servers @() -Prepare $false -Now $pwNow
+Check "a plan with no servers is refused"      ((-not $r.Ok) -and ($r.Error -match 'No servers'))
+
+Case "who is rebooted is decided by what the install left behind"
+Set-PwGrid @(
+    @('SRV-E', 'Error',            'Yes'),
+    @('SRV-A', 'Reboot Required',  'Yes'),
+    @('SRV-B', 'Up to date',       'No'),
+    @('SRV-C', 'Still installing', 'Yes'),
+    @('SRV-D', 'Installing...',    'Yes'))
+$pick = Get-PatchWindowRebootList -Servers @('SRV-E','SRV-A','SRV-B','SRV-C','SRV-D','SRV-X')
+Check "only those needing it, in plan order"   (($pick.Reboot -join ',') -eq 'SRV-E,SRV-A')
+$why = @{}; foreach ($s in $pick.Skipped) { $why[$s.ServerName] = $s.Reason }
+Check "a clean server is skipped as not needed" ($why['SRV-B'] -eq 'no reboot needed')
+Check "an install still running is not rebooted" ($why['SRV-C'] -match 'still busy')
+Check "nor one that is installing right now"   ($why['SRV-D'] -match 'still busy')
+Check "a removed server is named, not lost"    ($why['SRV-X'] -match 'no longer')
+
+Case "one server needing a reboot is still a list of one"
+Set-PwGrid @(,@('SRV-A', 'Reboot Required', 'Yes'))
+$pick = Get-PatchWindowRebootList -Servers @('SRV-A')
+Check "the name comes back whole"              ((@($pick.Reboot).Count -eq 1) -and ($pick.Reboot[0] -eq 'SRV-A'))
+
+Case "nothing happens before the reboot time"
+Reset-Pw
+Set-PwGrid @(,@('SRV-A', 'Reboot Required', 'Yes'))
+$script:PatchWindow = New-TestPlan -Servers @('SRV-A')
+Step-PatchWindow -Now $pwAt.AddMinutes(-1)
+Check "no reboot was started"                  ($script:RebootStarted.Count -eq 0)
+Check "the plan is still waiting"              ($script:PatchWindow.Phase -eq 'Waiting')
+
+Case "at the reboot time the first server goes down and the rest queue in order"
+Reset-Pw
+Set-PwGrid @(
+    @('SRV-A', 'Reboot Required', 'Yes'),
+    @('SRV-B', 'Up to date',      'No'),
+    @('SRV-C', 'Reboot Required', 'Yes'),
+    @('SRV-D', 'Reboot Required', 'Yes'))
+$script:PatchWindow = New-TestPlan -Servers @('SRV-C','SRV-B','SRV-A','SRV-D')
+Step-PatchWindow -Now $pwAt
+Check "exactly one server was rebooted"        ($script:RebootStarted.Count -eq 1)
+Check "it is the first in the plan"            ($script:RebootStarted[0] -eq 'SRV-C')
+Check "the rest wait in the plan's order"      ((@($script:RebootQueue) -join ',') -eq 'SRV-A,SRV-D')
+Check "the run is marked as running"           ($script:RebootQueueRunning)
+Check "each server will be scanned before the next" ($script:RebootVerifyScan)
+Check "the plan is now rebooting"              ($script:PatchWindow.Phase -eq 'Rebooting')
+Check "the skipped server is in the log"       ((Get-LoggedLike '*not rebooting SRV-B*no reboot needed*').Count -eq 1)
+Step-PatchWindow -Now $pwAt.AddMinutes(1)
+Check "a later tick does not start another"    ($script:RebootStarted.Count -eq 1)
+
+Case "a run started by hand is waited for, and that is said once"
+Reset-Pw
+Set-PwGrid @(,@('SRV-A', 'Reboot Required', 'Yes'))
+$script:PatchWindow = New-TestPlan -Servers @('SRV-A')
+$script:RebootQueueRunning = $true
+Step-PatchWindow -Now $pwAt
+Step-PatchWindow -Now $pwAt.AddSeconds(30)
+Check "nothing was rebooted underneath it"     ($script:RebootStarted.Count -eq 0)
+Check "the wait was logged exactly once"       ((Get-LoggedLike 'WARN|*waiting for it to finish*').Count -eq 1)
+$script:RebootQueueRunning = $false
+Step-PatchWindow -Now $pwAt.AddMinutes(5)
+Check "once it is over, the window goes ahead" ($script:RebootStarted -contains 'SRV-A')
+
+Case "the install starts once every scan is back"
+Reset-Pw
+Set-PwGrid @(
+    @('SRV-A', 'Scanning...',   '-'),
+    @('SRV-B', 'Available (2)', 'No'),
+    @('SRV-C', 'Up to date',    'No'))
+$script:PatchWindow = New-TestPlan -Servers @('SRV-A','SRV-B','SRV-C') -Prepare $true
+Step-PatchWindow -Now $pwNow
+Check "no install while a scan is still out"   ($script:Installed.Count -eq 0)
+Set-PwRow 'SRV-A' 'Available (1)' 'No'
+Step-PatchWindow -Now $pwNow
+Check "servers with updates are installed"     (($script:Installed -join ',') -eq 'SRV-A,SRV-B')
+Check "an up-to-date server is left alone"     (-not ($script:Installed -contains 'SRV-C'))
+Check "the plan is now installing"             ($script:PatchWindow.Phase -eq 'Installing')
+
+Case "the install phase ends only when nothing is busy"
+Set-PwRow 'SRV-A' 'Installing...'
+Set-PwRow 'SRV-B' 'Checking...'
+Step-PatchWindow -Now $pwNow
+Check "still installing while installs run"    ($script:PatchWindow.Phase -eq 'Installing')
+Set-PwRow 'SRV-A' 'Reboot Required' 'Yes'
+Set-PwRow 'SRV-B' 'Scanning...'
+Step-PatchWindow -Now $pwNow
+Check "a confirming rescan is waited for too"  ($script:PatchWindow.Phase -eq 'Installing')
+Set-PwRow 'SRV-B' 'Up to date' 'No'
+Step-PatchWindow -Now $pwNow
+Check "then it waits for the reboot time"      ($script:PatchWindow.Phase -eq 'Waiting')
+Check "the log says how many need a reboot"    ((Get-LoggedLike '*install finished - 1 server(s) need a reboot*').Count -eq 1)
+Check "no reboot yet"                          ($script:RebootStarted.Count -eq 0)
+
+Case "the reboot time cuts a slow install short, around the busy server"
+Reset-Pw
+Set-PwGrid @(
+    @('SRV-A', 'Installing...',   '-'),
+    @('SRV-B', 'Reboot Required', 'Yes'))
+$script:PatchWindow = New-TestPlan -Servers @('SRV-A','SRV-B') -Prepare $true
+$script:PatchWindow.Phase = 'Installing'
+Step-PatchWindow -Now $pwAt
+Check "the ready server is rebooted"           ($script:RebootStarted -contains 'SRV-B')
+Check "the one still installing is not"        (-not ($script:RebootStarted -contains 'SRV-A'))
+
+Case "nobody needs a reboot"
+Reset-Pw
+Set-PwGrid @(,@('SRV-A', 'Up to date', 'No'))
+$script:PatchWindow = New-TestPlan -Servers @('SRV-A')
+Step-PatchWindow -Now $pwAt
+Check "nothing was rebooted"                   ($script:RebootStarted.Count -eq 0)
+Check "the window is closed"                   ($null -eq $script:PatchWindow)
+Check "and the log says why"                   ((Get-LoggedLike '*no server needs a reboot*').Count -eq 1)
+
+Case "the morning report names every server that is not clean"
+Reset-Pw
+Set-PwGrid @(
+    @('SRV-A', 'Up to date',    'No'),
+    @('SRV-B', 'Available (1)', 'No',  'KB5000001: Cumulative Update'),
+    @('SRV-C', 'Offline',       'Pending', 'Server did not respond after reboot.'))
+$script:PatchWindow = New-TestPlan -Servers @('SRV-A','SRV-B','SRV-C','SRV-D')
+$script:PatchWindow.Phase   = 'Rebooting'
+$script:PatchWindow.Queued  = @('SRV-A','SRV-B','SRV-C')
+$script:PatchWindow.Skipped = @([PSCustomObject]@{ ServerName = 'SRV-D'; Reason = 'no reboot needed' })
+Save-PatchWindow
+Complete-PatchWindow
+Check "the totals add up"                      ((Get-LoggedLike 'WARN|Patch window finished: 3 rebooted, 1 clean, 2 need attention, 1 skipped').Count -eq 1)
+Check "updates still pending are flagged"      ((Get-LoggedLike 'WARN|*needs attention - SRV-B : Available (1)*KB5000001*').Count -eq 1)
+Check "a server that did not come back is flagged" ((Get-LoggedLike 'WARN|*needs attention - SRV-C : Offline*').Count -eq 1)
+Check "the clean one is not"                   ((Get-LoggedLike '*needs attention - SRV-A*').Count -eq 0)
+Check "the skipped one is listed"              ((Get-LoggedLike '*skipped - SRV-D : no reboot needed*').Count -eq 1)
+Check "the window is closed"                   ($null -eq $script:PatchWindow)
+Check "and forgotten on disk"                  (-not (Test-Path -LiteralPath $script:PatchWindowFile))
+
+Case "a clean night is reported as such"
+Reset-Pw
+Set-PwGrid @(,@('SRV-A', 'Up to date', 'No'))
+$script:PatchWindow = New-TestPlan -Servers @('SRV-A')
+$script:PatchWindow.Phase  = 'Rebooting'
+$script:PatchWindow.Queued = @('SRV-A')
+Complete-PatchWindow
+Check "the summary is not a warning"           ((Get-LoggedLike 'INFO|Patch window finished: 1 rebooted, 1 clean, 0 need attention*').Count -eq 1)
+
+Case "a plan survives a restart, one server included"
+Reset-Pw
+$script:PatchWindow = New-TestPlan -Servers @('SRV-A')
+$script:PatchWindow.Phase = 'Installing'
+Save-PatchWindow
+$script:PatchWindow = $null
+$back = Read-PatchWindow
+Check "it was read back"                       ($null -ne $back)
+Check "the reboot time is exact"               ($back.RebootAt -eq $pwAt)
+Check "the single server is whole"             ((@($back.Servers).Count -eq 1) -and ($back.Servers[0] -eq 'SRV-A'))
+Check "it comes back waiting - its jobs died with the session" ($back.Phase -eq 'Waiting')
+
+Case "a time taken from this computer's clock is not shifted by its zone"
+# The dialog's dates come from Get-Date and carry the local zone; they are
+# written with their offset and must come back as the same wall-clock time.
+$localAt = (Get-Date).Date.AddDays(3).AddHours(2)
+$script:PatchWindow = (New-PatchWindowPlan -Day $localAt.Date -TimeText '02:00' -Servers @('SRV-A') -Prepare $false).Plan
+Save-PatchWindow
+$back = Read-PatchWindow
+Check "still 02:00 on the same day"            ($back.RebootAt -eq $localAt)
+Check "the file records the offset"            ((Get-Content -LiteralPath $script:PatchWindowFile -Raw) -match 'T02:00:00\.0000000[+-]\d\d:\d\d')
+
+Case "the order survives a restart"
+$script:PatchWindow = New-TestPlan -Servers @('SRV-C','SRV-A','SRV-B')
+Save-PatchWindow
+$back = Read-PatchWindow
+Check "same servers, same order"               (($back.Servers -join ',') -eq 'SRV-C,SRV-A,SRV-B')
+
+Case "a damaged file is reported, not trusted"
+Reset-Pw
+Set-Content -LiteralPath $script:PatchWindowFile -Value '{ not json' -Encoding UTF8
+Check "nothing is restored"                    ($null -eq (Read-PatchWindow))
+Check "the problem is logged"                  ((Get-LoggedLike 'WARN|*could not be read*').Count -eq 1)
+
+Case "cancelling forgets the plan"
+Reset-Pw
+$script:PatchWindow = New-TestPlan -Servers @('SRV-A')
+Save-PatchWindow
+Clear-PatchWindow -Reason 'Cancelled by user'
+Check "the plan is gone"                       ($null -eq $script:PatchWindow)
+Check "so is its file"                         (-not (Test-Path -LiteralPath $script:PatchWindowFile))
+Check "the log says who cancelled it"          ((Get-LoggedLike 'WARN|*cancelled: Cancelled by user*').Count -eq 1)
+
+Case "the countdown reads like a person wrote it"
+Check "hours and minutes"                      ((Format-PatchWindowCountdown -Left (New-TimeSpan -Hours 3 -Minutes 12)) -eq 'in 3 h 12 min')
+Check "days for the far future"                ((Format-PatchWindowCountdown -Left (New-TimeSpan -Hours 25)) -eq 'in 1 d 1 h')
+Check "minutes when close"                     ((Format-PatchWindowCountdown -Left (New-TimeSpan -Minutes 45)) -eq 'in 45 min')
+Check "the last minute"                        ((Format-PatchWindowCountdown -Left (New-TimeSpan -Seconds 30)) -eq 'in under a minute')
+$banner = Get-PatchWindowBannerText -Window (New-TestPlan -Servers @('SRV-A','SRV-B')) -Now $pwNow
+Check "the banner gives the time"              ($banner -match '02:00')
+Check "and how long is left"                   ($banner -match '\(in 14 h 0 min\)')
+Check "and how many servers"                   ($banner -match '2 server\(s\)')
+Check "no plan, no banner"                     ((Get-PatchWindowBannerText -Window $null -Now $pwNow) -eq '')
+
+Case "the confirmation spells out the order"
+$text = Get-PatchWindowSummary -Plan (New-TestPlan -Servers @('SRV-C','SRV-A') -Prepare $true)
+Check "the first server is numbered first"     ($text -match '1\. SRV-C')
+Check "the second second"                      ($text -match '2\. SRV-A')
+Check "the install step is mentioned"          ($text -match 'install updates on them in parallel')
+Check "and that the window must stay open"     ($text -match 'Locking the screen is fine')
+
+# -- The reboot chain waits for the verifying scan ----------------------------
+Invoke-Expression (Get-FunctionText -Name 'Start-RebootMonitor')
+$script:Launched   = $null
+$script:Advanced   = 0
+$script:HandOnSeen = $null
+$script:StubHandOn = $true
+function Start-AsyncJob {
+    param([ScriptBlock]$ScriptBlock, [object[]]$Arguments, [ScriptBlock]$OnComplete)
+    $script:Launched = [PSCustomObject]@{ ScriptBlock = $ScriptBlock; Arguments = $Arguments; OnComplete = $OnComplete }
+}
+function Get-ServerCredential { param([string]$ServerName) "cred-for-$ServerName" }
+function Step-RebootQueue { param([switch]$AfterFailure) $script:Advanced++ }
+function Complete-RebootMonitor {
+    param([string]$ServerName, $Monitor, [switch]$HandOnAfterScan)
+    $script:HandOnSeen = [bool]$HandOnAfterScan
+    return ([bool]$HandOnAfterScan -and $script:StubHandOn)
+}
+function Invoke-MonitorCallback {
+    param([bool]$Verify, [switch]$Sequential)
+    $script:Advanced = 0; $script:HandOnSeen = $null
+    $script:RebootVerifyScan = $Verify
+    Start-RebootMonitor -ServerName 'srv-v' -BootBefore (Get-Date) -Sequential:$Sequential
+    & $script:Launched.OnComplete ([PSCustomObject]@{ Phase = 'Online' })
+}
+
+Case "in a patch window the scan, not the monitor, hands the queue on"
+$script:StubHandOn = $true
+Invoke-MonitorCallback -Verify $true -Sequential
+Check "the monitor was told to hand on via the scan" ($script:HandOnSeen)
+Check "the next server is not rebooted yet"    ($script:Advanced -eq 0)
+
+Case "no scan was started (server never came back), so the monitor hands on"
+$script:StubHandOn = $false
+Invoke-MonitorCallback -Verify $true -Sequential
+Check "the queue still moves on"               ($script:Advanced -eq 1)
+
+Case "a sequential reboot started by hand is unchanged"
+$script:StubHandOn = $true
+Invoke-MonitorCallback -Verify $false -Sequential
+Check "no scan hand-over was asked for"        (-not $script:HandOnSeen)
+Check "the queue moves on as before"           ($script:Advanced -eq 1)
+
+Case "a single reboot never hands on, flag or not"
+Invoke-MonitorCallback -Verify $true
+Check "no scan hand-over was asked for"        (-not $script:HandOnSeen)
+Check "the queue was not touched"              ($script:Advanced -eq 0)
+
+Invoke-Expression (Get-FunctionText -Name 'Complete-RebootMonitor')
+$script:ScanHandsOn = $null
+function Invoke-ScanServer {
+    param([string]$ServerName, [switch]$NoProgress, [switch]$ThenStepRebootQueue)
+    $script:Rescans += $ServerName
+    $script:ScanHandsOn = [bool]$ThenStepRebootQueue
+}
+function Invoke-RealMonitor {
+    param($Monitor, [switch]$HandOn)
+    $script:Rescans = @(); $script:ScanHandsOn = $null; $script:Logged = @()
+    ,@(Complete-RebootMonitor -ServerName 'srv-m' -Monitor $Monitor -HandOnAfterScan:$HandOn)
+}
+
+Case "a server back online is scanned, and the scan carries the queue"
+$out = Invoke-RealMonitor ([PSCustomObject]@{ Phase = 'Online' }) -HandOn
+Check "the scan was started"                   ($script:Rescans -contains 'srv-m')
+Check "the scan was asked to hand on"          ($script:ScanHandsOn)
+Check "it reports that it handed on, and nothing else" (($out.Count -eq 1) -and ($out[0] -eq $true))
+
+Case "a server that never came back is not scanned, so it does not hand on"
+$out = Invoke-RealMonitor ([PSCustomObject]@{ Phase = 'Timeout'; Error = 'gone' }) -HandOn
+Check "no scan"                                ($script:Rescans.Count -eq 0)
+Check "it reports that it did not hand on"     (($out.Count -eq 1) -and ($out[0] -eq $false))
+
+Case "a lost monitor falls back to a scan, which carries the queue"
+$out = Invoke-RealMonitor $null -HandOn
+Check "the fallback scan was asked to hand on" ($script:ScanHandsOn)
+Check "it reports that it handed on"           ($out[0] -eq $true)
+
+Case "outside a patch window the scan does not touch the queue"
+$out = Invoke-RealMonitor ([PSCustomObject]@{ Phase = 'Online' })
+Check "the scan was not asked to hand on"      ($script:ScanHandsOn -eq $false)
+Check "it reports that it did not hand on"     ($out[0] -eq $false)
+
+Invoke-Expression (Get-FunctionText -Name 'Invoke-ScanServer')
+$script:CredOk = $true
+function Ensure-Credential { $script:CredOk }
+function Invoke-ScanWith {
+    param($Result, [switch]$HandOn)
+    $script:Advanced = 0; $script:Launched = $null; $script:Logged = @()
+    Invoke-ScanServer -ServerName 'srv-s' -NoProgress -ThenStepRebootQueue:$HandOn
+    if ($script:Launched) { & $script:Launched.OnComplete $Result }
+}
+
+Case "the verifying scan hands the queue on once it is done"
+$script:CredOk = $true
+$script:Advanced = 0; $script:Launched = $null
+Invoke-ScanServer -ServerName 'srv-s' -NoProgress -ThenStepRebootQueue
+Check "not while the scan is still running"    ($script:Advanced -eq 0)
+& $script:Launched.OnComplete ([PSCustomObject]@{ Success = $true; Count = 0; RebootRequired = $false; Updates = @() })
+Check "exactly once when it finishes"          ($script:Advanced -eq 1)
+
+Case "a failed verifying scan does not strand the queue"
+Invoke-ScanWith ([PSCustomObject]@{ Success = $false; Error = 'WinRM cannot complete the operation' }) -HandOn
+Check "the queue still moves on"               ($script:Advanced -eq 1)
+
+Case "a scan that cannot even start does not strand the queue"
+$script:CredOk = $false
+Invoke-ScanWith $null -HandOn
+Check "the queue still moves on"               ($script:Advanced -eq 1)
+$script:CredOk = $true
+
+Case "an ordinary scan leaves the queue alone"
+Invoke-ScanWith ([PSCustomObject]@{ Success = $true; Count = 0; RebootRequired = $false; Updates = @() })
+Check "the queue was not touched"              ($script:Advanced -eq 0)
+
+# -- The queue draining is what ends the window -------------------------------
+Invoke-Expression (Get-FunctionText -Name 'Step-RebootQueue')
+
+Case "the last reboot of a patch window ends it with the report"
+Reset-Pw
+Set-PwGrid @(,@('SRV-A', 'Up to date', 'No'))
+$script:PatchWindow = New-TestPlan -Servers @('SRV-A')
+$script:PatchWindow.Phase  = 'Rebooting'
+$script:PatchWindow.Queued = @('SRV-A')
+$script:RebootQueueRunning = $true
+$script:RebootVerifyScan   = $true
+Step-RebootQueue
+Check "the run is over"                        (-not $script:RebootQueueRunning)
+Check "scans stop gating later manual reboots" (-not $script:RebootVerifyScan)
+Check "the report was written"                 ((Get-LoggedLike '*Patch window finished*').Count -eq 1)
+Check "the window is closed"                   ($null -eq $script:PatchWindow)
+
+Case "a manual reboot run ending does not end a window still waiting"
+Reset-Pw
+$script:PatchWindow = New-TestPlan -Servers @('SRV-A')
+$script:RebootQueueRunning = $true
+Step-RebootQueue
+Check "the window is still armed"              ($null -ne $script:PatchWindow)
+Check "no report was written"                  ((Get-LoggedLike '*Patch window finished*').Count -eq 0)
+
+# -- Stop means stop ----------------------------------------------------------
+Invoke-Expression (Get-FunctionText -Name 'Stop-AllOperations')
+
+Case "Stop also disarms the patch window"
+Reset-Pw
+$script:ActiveJobs.Clear()
+Set-PwGrid @(,@('SRV-A', 'Up to date', 'No'))
+$script:PatchWindow = New-TestPlan -Servers @('SRV-A')
+$script:RebootVerifyScan = $true
+Save-PatchWindow
+Stop-AllOperations -Reason 'Stopped by user'
+Check "the plan is gone"                       ($null -eq $script:PatchWindow)
+Check "so is its file"                         (-not (Test-Path -LiteralPath $script:PatchWindowFile))
+Check "the scan gate is lifted"                (-not $script:RebootVerifyScan)
+Check "the log says why"                       ((Get-LoggedLike 'WARN|*cancelled: Stopped by user*').Count -eq 1)
+
+Remove-Item -LiteralPath $pwDir -Recurse -Force -ErrorAction SilentlyContinue
 
 
 # =============================================================================
