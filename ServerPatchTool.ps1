@@ -3616,7 +3616,10 @@ $ui.btnCancelPatchWindow.Add_Click({
     $confirm = [System.Windows.MessageBox]::Show(
         "Cancel the patch window for $($script:PatchWindow.RebootAt.ToString('dd.MM.yyyy HH:mm'))?`n`nNo server will be rebooted by it. Scans or installs it has already started carry on.",
         "Cancel Patch Window",
-        [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question)
+        [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question,
+        # No is the default, as in every patch-window prompt: a reflexive Enter
+        # must not throw away the night's plan.
+        [System.Windows.MessageBoxResult]::No)
     if ($confirm -eq "Yes") { Clear-PatchWindow }
 })
 
