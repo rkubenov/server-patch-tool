@@ -3422,6 +3422,33 @@ $script:PatchWindowXaml = @'
             </Grid.ColumnDefinitions>
             <ListBox x:Name="lbPwServers" Grid.Column="0" Background="#181825" Foreground="#cdd6f4"
                      BorderBrush="#45475a">
+                <!-- The stock item template greys out a selected row once the
+                     list loses focus - which it does the moment Up or Down is
+                     pressed - leaving the row being moved unreadable. -->
+                <ListBox.ItemContainerStyle>
+                    <Style TargetType="ListBoxItem">
+                        <Setter Property="Foreground" Value="#cdd6f4"/>
+                        <Setter Property="Padding" Value="4,2"/>
+                        <Setter Property="Template">
+                            <Setter.Value>
+                                <ControlTemplate TargetType="ListBoxItem">
+                                    <Border x:Name="row" Background="Transparent" CornerRadius="3"
+                                            Padding="{TemplateBinding Padding}">
+                                        <ContentPresenter/>
+                                    </Border>
+                                    <ControlTemplate.Triggers>
+                                        <Trigger Property="IsMouseOver" Value="True">
+                                            <Setter TargetName="row" Property="Background" Value="#313244"/>
+                                        </Trigger>
+                                        <Trigger Property="IsSelected" Value="True">
+                                            <Setter TargetName="row" Property="Background" Value="#45475a"/>
+                                        </Trigger>
+                                    </ControlTemplate.Triggers>
+                                </ControlTemplate>
+                            </Setter.Value>
+                        </Setter>
+                    </Style>
+                </ListBox.ItemContainerStyle>
                 <ListBox.ItemTemplate>
                     <DataTemplate>
                         <StackPanel Orientation="Horizontal">
@@ -3446,7 +3473,7 @@ $script:PatchWindowXaml = @'
 
         <StackPanel Grid.Row="4" Orientation="Horizontal" Margin="0,0,0,6">
             <TextBlock Text="Reboot on:" Foreground="#a6adc8" VerticalAlignment="Center" Margin="0,0,8,0"/>
-            <ComboBox x:Name="cboPwDay" Width="170" VerticalAlignment="Center"/>
+            <ComboBox x:Name="cboPwDay" Width="220" VerticalAlignment="Center"/>
             <TextBlock Text="at" Foreground="#a6adc8" VerticalAlignment="Center" Margin="10,0,8,0"/>
             <TextBox x:Name="txtPwTime" Width="70" Text="02:00" VerticalContentAlignment="Center"
                      ToolTip="24-hour time on this computer's clock, e.g. 02:00"/>
