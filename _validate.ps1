@@ -54,10 +54,10 @@ try {
         $reader = [System.Xml.XmlNodeReader]::new($xamlDoc)
         $window = [Windows.Markup.XamlReader]::Load($reader)
 
-        # Names declared inside a ControlTemplate belong to the template's own
+        # Names declared inside a ControlTemplate or DataTemplate belong to the template's own
         # namescope and are deliberately not reachable via Window.FindName.
         $named = $xamlDoc.SelectNodes(
-            "//*[@*[local-name()='Name']][not(ancestor::*[local-name()='ControlTemplate'])]")
+            "//*[@*[local-name()='Name']][not(ancestor::*[local-name()='ControlTemplate' or local-name()='DataTemplate'])]")
         $names = @($named | ForEach-Object {
             $_.GetAttribute('Name', 'http://schemas.microsoft.com/winfx/2006/xaml')
         } | Where-Object { $_ })
@@ -83,7 +83,7 @@ try {
             [xml]$dlgDoc = $dlgMatch.Groups[1].Value.Replace('__RESOURCES__', $res.InnerXml)
             $dlg = [Windows.Markup.XamlReader]::Load([System.Xml.XmlNodeReader]::new($dlgDoc))
             $dlgNames = @($dlgDoc.SelectNodes(
-                "//*[@*[local-name()='Name']][not(ancestor::*[local-name()='ControlTemplate'])]") |
+                "//*[@*[local-name()='Name']][not(ancestor::*[local-name()='ControlTemplate' or local-name()='DataTemplate'])]") |
                 ForEach-Object { $_.GetAttribute('Name', 'http://schemas.microsoft.com/winfx/2006/xaml') } |
                 Where-Object { $_ })
             $dlgMissing = @($dlgNames | Where-Object { -not $dlg.FindName($_) })

@@ -3466,10 +3466,17 @@ $script:PatchWindowXaml = @'
                         <StackPanel Orientation="Horizontal">
                             <CheckBox IsChecked="{Binding Include, Mode=TwoWay}" VerticalAlignment="Center"
                                       Margin="0,0,6,0" ToolTip="Untick to leave this server out of the window"/>
-                            <TextBlock Text="{Binding Position}" Width="30" Foreground="#6c7086"/>
+                            <TextBlock x:Name="pos" Text="{Binding Position}" Width="30" Foreground="#6c7086"/>
                             <TextBlock Text="{Binding ServerName}" Width="170"/>
-                            <TextBlock Text="{Binding Hint}" Foreground="#6c7086"/>
+                            <TextBlock x:Name="hint" Text="{Binding Hint}" Foreground="#6c7086"/>
                         </StackPanel>
+                        <!-- The dim grey is lost on the selection colour. -->
+                        <DataTemplate.Triggers>
+                            <DataTrigger Binding="{Binding IsSelected, RelativeSource={RelativeSource AncestorType=ListBoxItem}}" Value="True">
+                                <Setter TargetName="pos" Property="Foreground" Value="#bac2de"/>
+                                <Setter TargetName="hint" Property="Foreground" Value="#bac2de"/>
+                            </DataTrigger>
+                        </DataTemplate.Triggers>
                     </DataTemplate>
                 </ListBox.ItemTemplate>
             </ListBox>
