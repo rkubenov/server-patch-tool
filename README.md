@@ -153,7 +153,7 @@ Parses the main file, loads the XAML markup (the main window, and the patch-wind
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File _tests.ps1
 ```
 
-Behavioural tests — 364 checks, no live server and no window required. The tool is a single file that builds a window as it loads, so it cannot simply be dot-sourced; instead each unit under test is located in the real file with the PowerShell parser and evaluated on its own against stubs. That way the shipped code is exercised rather than a copy of it, and a test fails loudly if the code it targets is renamed or moved.
+Behavioural tests — 365 checks, no live server and no window required. The tool is a single file that builds a window as it loads, so it cannot simply be dot-sourced; instead each unit under test is located in the real file with the PowerShell parser and evaluated on its own against stubs. That way the shipped code is exercised rather than a copy of it, and a test fails loudly if the code it targets is renamed or moved.
 
 Covered: the job completion timer, install reporting, credential selection, removal and password changes, the stale-password guard and the credential test, held-back updates and the install pre-flight, the post-reboot monitor and how it is launched, the sequential queues, deferred re-checks, both time limits, and the patch window (plan validation, who is rebooted and in what order, the phases and the reboot time, the scan-before-next hand-over, the morning report, saving and restoring the plan, and Stop disarming it).
 

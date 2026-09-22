@@ -3122,7 +3122,13 @@ function Get-PatchWindowBannerText {
         default      { "waiting" }
     }
     $left = Format-PatchWindowCountdown -Left ($Window.RebootAt - $Now)
-    return "Patch window: $doing - reboot $($Window.RebootAt.ToString('ddd dd.MM HH:mm')) ($left), $n server(s)"
+    # Once the install is over, the count that matters is how many will
+    # actually go down - the same rule the reboot itself will apply.
+    $count = if ($Window.Phase -eq 'Waiting') {
+        $need = @((Get-PatchWindowRebootList -Servers $Window.Servers).Reboot).Count
+        "$need of $n need a reboot"
+    } else { "$n server(s)" }
+    return "Patch window: $doing - reboot $($Window.RebootAt.ToString('ddd dd.MM HH:mm')) ($left), $count"
 }
 
 function Update-PatchWindowBanner {

@@ -1489,10 +1489,16 @@ Check "hours and minutes"                      ((Format-PatchWindowCountdown -Le
 Check "days for the far future"                ((Format-PatchWindowCountdown -Left (New-TimeSpan -Hours 25)) -eq 'in 1 d 1 h')
 Check "minutes when close"                     ((Format-PatchWindowCountdown -Left (New-TimeSpan -Minutes 45)) -eq 'in 45 min')
 Check "the last minute"                        ((Format-PatchWindowCountdown -Left (New-TimeSpan -Seconds 30)) -eq 'in under a minute')
+Set-PwGrid @(
+    @('SRV-A', 'Reboot Required', 'Yes'),
+    @('SRV-B', 'Up to date',      'No'))
 $banner = Get-PatchWindowBannerText -Window (New-TestPlan -Servers @('SRV-A','SRV-B')) -Now $pwNow
 Check "the banner gives the time"              ($banner -match '02:00')
 Check "and how long is left"                   ($banner -match '\(in 14 h 0 min\)')
-Check "and how many servers"                   ($banner -match '2 server\(s\)')
+Check "while waiting, how many will go down"   ($banner -match '1 of 2 need a reboot')
+$preparing = New-TestPlan -Servers @('SRV-A','SRV-B') -Prepare $true
+$banner = Get-PatchWindowBannerText -Window $preparing -Now $pwNow
+Check "before the install, just how many servers" ($banner -match 'scanning.*2 server\(s\)$')
 Check "no plan, no banner"                     ((Get-PatchWindowBannerText -Window $null -Now $pwNow) -eq '')
 
 Case "the confirmation spells out the order"
