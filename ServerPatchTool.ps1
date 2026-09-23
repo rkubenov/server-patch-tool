@@ -3448,8 +3448,10 @@ $script:PatchWindowXaml = @'
             <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
 
+        <!-- Describes the reboot only: what runs beforehand is the operator's
+             choice further down, and this line used to contradict it. -->
         <TextBlock Grid.Row="0" TextWrapping="Wrap" Foreground="#a6adc8" Margin="0,0,0,10"
-                   Text="Scan and install now in parallel, then reboot one by one at the time below. Only servers that need a reboot by then are rebooted; each is scanned after it comes back, before the next one goes down."/>
+                   Text="At the time below, the servers are rebooted one by one, in the order set here. Only those that need a reboot by then are, and each is scanned after it comes back, before the next one goes down."/>
 
         <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,0,0,6">
             <TextBlock Text="Servers:" Foreground="#a6adc8" VerticalAlignment="Center" Margin="0,0,8,0"/>
