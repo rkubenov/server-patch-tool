@@ -1269,37 +1269,48 @@ function Reset-Pw {
 $pwNow = [datetime]'2030-01-01 12:00'
 $pwDay = [datetime]'2030-01-02'
 function New-TestPlan {
-    param([string[]]$Servers, [bool]$Prepare = $false)
-    (New-PatchWindowPlan -Day $pwDay -TimeText '02:00' -Servers $Servers -Prepare $Prepare -Now $pwNow).Plan
+    param([string[]]$Servers, [string]$Mode = 'None')
+    (New-PatchWindowPlan -Day $pwDay -TimeText '02:00' -Servers $Servers -Mode $Mode -Now $pwNow).Plan
 }
 $pwAt = $pwDay.AddHours(2)
 
 Case "a plan keeps the operator's order, and a name given twice once"
-$r = New-PatchWindowPlan -Day $pwDay -TimeText '02:00' -Servers @('SRV-C','SRV-A','SRV-B','SRV-A') -Prepare $true -Now $pwNow
+$r = New-PatchWindowPlan -Day $pwDay -TimeText '02:00' -Servers @('SRV-C','SRV-A','SRV-B','SRV-A') -Mode 'ScanInstall' -Now $pwNow
 Check "it is accepted"                         ($r.Ok)
 Check "the reboot time is the day plus the time" ($r.Plan.RebootAt -eq $pwAt)
 Check "the order is kept exactly"              (($r.Plan.Servers -join ',') -eq 'SRV-C,SRV-A,SRV-B')
 Check "with the install step it starts by scanning" ($r.Plan.Phase -eq 'Scanning')
 
-Case "without the install step it only waits"
+Case "servers patched by hand elsewhere are scanned but not installed to"
+$p = New-TestPlan -Servers @('SRV-A') -Mode 'ScanOnly'
+Check "it still starts by scanning"            ($p.Phase -eq 'Scanning')
+Check "the mode is kept"                       ($p.Mode -eq 'ScanOnly')
+
+Case "with nothing to run now it only waits"
 Check "the phase is Waiting"                   ((New-TestPlan -Servers @('SRV-A')).Phase -eq 'Waiting')
+
+Case "a mode that does not exist is refused outright"
+$threw = $false
+try { New-PatchWindowPlan -Day $pwDay -TimeText '02:00' -Servers @('SRV-A') -Mode 'Whatever' -Now $pwNow | Out-Null }
+catch { $threw = $true }
+Check "it does not quietly become a scan"      ($threw)
 
 Case "one server is still a list of one"
 $p = New-TestPlan -Servers @('SRV-A')
 Check "one server, not its letters"            ((@($p.Servers).Count -eq 1) -and ($p.Servers[0] -eq 'SRV-A'))
 
 Case "a time with a dot is read too"
-$r = New-PatchWindowPlan -Day $pwDay -TimeText ' 2.30 ' -Servers @('SRV-A') -Prepare $false -Now $pwNow
+$r = New-PatchWindowPlan -Day $pwDay -TimeText ' 2.30 ' -Servers @('SRV-A') -Mode 'None' -Now $pwNow
 Check "02:30 was understood"                   ($r.Ok -and $r.Plan.RebootAt -eq $pwDay.AddMinutes(150))
 
 Case "input that cannot be right is refused, with a reason"
-$r = New-PatchWindowPlan -Day $pwDay -TimeText '25:00' -Servers @('SRV-A') -Prepare $false -Now $pwNow
+$r = New-PatchWindowPlan -Day $pwDay -TimeText '25:00' -Servers @('SRV-A') -Mode 'None' -Now $pwNow
 Check "an impossible time is refused"          ((-not $r.Ok) -and ($r.Error -match 'not a time'))
-$r = New-PatchWindowPlan -Day $pwDay -TimeText '2am' -Servers @('SRV-A') -Prepare $false -Now $pwNow
+$r = New-PatchWindowPlan -Day $pwDay -TimeText '2am' -Servers @('SRV-A') -Mode 'None' -Now $pwNow
 Check "a time that is not HH:mm is refused"    (-not $r.Ok)
-$r = New-PatchWindowPlan -Day $pwNow.Date -TimeText '11:00' -Servers @('SRV-A') -Prepare $false -Now $pwNow
+$r = New-PatchWindowPlan -Day $pwNow.Date -TimeText '11:00' -Servers @('SRV-A') -Mode 'None' -Now $pwNow
 Check "a time already gone is refused"         ((-not $r.Ok) -and ($r.Error -match 'already passed'))
-$r = New-PatchWindowPlan -Day $pwDay -TimeText '02:00' -Servers @() -Prepare $false -Now $pwNow
+$r = New-PatchWindowPlan -Day $pwDay -TimeText '02:00' -Servers @() -Mode 'None' -Now $pwNow
 Check "a plan with no servers is refused"      ((-not $r.Ok) -and ($r.Error -match 'No servers'))
 
 Case "who is rebooted is decided by what the install left behind"
@@ -1368,7 +1379,7 @@ Set-PwGrid @(
     @('SRV-A', 'Scanning...',   '-'),
     @('SRV-B', 'Available (2)', 'No'),
     @('SRV-C', 'Up to date',    'No'))
-$script:PatchWindow = New-TestPlan -Servers @('SRV-A','SRV-B','SRV-C') -Prepare $true
+$script:PatchWindow = New-TestPlan -Servers @('SRV-A','SRV-B','SRV-C') -Mode 'ScanInstall'
 Step-PatchWindow -Now $pwNow
 Check "no install while a scan is still out"   ($script:Installed.Count -eq 0)
 Set-PwRow 'SRV-A' 'Available (1)' 'No'
@@ -1392,12 +1403,31 @@ Check "then it waits for the reboot time"      ($script:PatchWindow.Phase -eq 'W
 Check "the log says how many need a reboot"    ((Get-LoggedLike '*install finished - 1 server(s) need a reboot*').Count -eq 1)
 Check "no reboot yet"                          ($script:RebootStarted.Count -eq 0)
 
+Case "servers patched by hand: the scan decides, and nothing is installed"
+# The updates went on outside this tool, so there is nothing to install - but
+# the scan still has to run, because it is what finds the pending reboot.
+Reset-Pw
+Set-PwGrid @(
+    @('SRV-A', 'Scanning...', '-'),
+    @('SRV-B', 'Up to date',  'No'))
+$script:PatchWindow = New-TestPlan -Servers @('SRV-A','SRV-B') -Mode 'ScanOnly'
+Step-PatchWindow -Now $pwNow
+Check "it waits for the scans"                 ($script:PatchWindow.Phase -eq 'Scanning')
+Set-PwRow 'SRV-A' 'Reboot Required' 'Yes'
+Step-PatchWindow -Now $pwNow
+Check "nothing was installed"                  ($script:Installed.Count -eq 0)
+Check "it goes straight to waiting"            ($script:PatchWindow.Phase -eq 'Waiting')
+Check "the log says how many need a reboot"    ((Get-LoggedLike '*scan finished - 1 server(s) need a reboot*').Count -eq 1)
+Step-PatchWindow -Now $pwAt
+Check "at the time, the one Windows waits for goes down" ($script:RebootStarted -contains 'SRV-A')
+Check "and the clean one does not"             (-not ($script:RebootStarted -contains 'SRV-B'))
+
 Case "the reboot time cuts a slow install short, around the busy server"
 Reset-Pw
 Set-PwGrid @(
     @('SRV-A', 'Installing...',   '-'),
     @('SRV-B', 'Reboot Required', 'Yes'))
-$script:PatchWindow = New-TestPlan -Servers @('SRV-A','SRV-B') -Prepare $true
+$script:PatchWindow = New-TestPlan -Servers @('SRV-A','SRV-B') -Mode 'ScanInstall'
 $script:PatchWindow.Phase = 'Installing'
 Step-PatchWindow -Now $pwAt
 Check "the ready server is rebooted"           ($script:RebootStarted -contains 'SRV-B')
@@ -1457,7 +1487,7 @@ Case "a time taken from this computer's clock is not shifted by its zone"
 # The dialog's dates come from Get-Date and carry the local zone; they are
 # written with their offset and must come back as the same wall-clock time.
 $localAt = (Get-Date).Date.AddDays(3).AddHours(2)
-$script:PatchWindow = (New-PatchWindowPlan -Day $localAt.Date -TimeText '02:00' -Servers @('SRV-A') -Prepare $false).Plan
+$script:PatchWindow = (New-PatchWindowPlan -Day $localAt.Date -TimeText '02:00' -Servers @('SRV-A') -Mode 'None').Plan
 Save-PatchWindow
 $back = Read-PatchWindow
 Check "still 02:00 on the same day"            ($back.RebootAt -eq $localAt)
@@ -1496,13 +1526,13 @@ $banner = Get-PatchWindowBannerText -Window (New-TestPlan -Servers @('SRV-A','SR
 Check "the banner gives the time"              ($banner -match '02:00')
 Check "and how long is left"                   ($banner -match '\(in 14 h 0 min\)')
 Check "while waiting, how many will go down"   ($banner -match '1 of 2 need a reboot')
-$preparing = New-TestPlan -Servers @('SRV-A','SRV-B') -Prepare $true
+$preparing = New-TestPlan -Servers @('SRV-A','SRV-B') -Mode 'ScanInstall'
 $banner = Get-PatchWindowBannerText -Window $preparing -Now $pwNow
 Check "before the install, just how many servers" ($banner -match 'scanning.*2 server\(s\)$')
 Check "no plan, no banner"                     ((Get-PatchWindowBannerText -Window $null -Now $pwNow) -eq '')
 
 Case "the confirmation spells out the order"
-$text = Get-PatchWindowSummary -Plan (New-TestPlan -Servers @('SRV-C','SRV-A') -Prepare $true)
+$text = Get-PatchWindowSummary -Plan (New-TestPlan -Servers @('SRV-C','SRV-A') -Mode 'ScanInstall')
 Check "the first server is numbered first"     ($text -match '1\. SRV-C')
 Check "the second second"                      ($text -match '2\. SRV-A')
 Check "the install step is mentioned"          ($text -match 'install updates on them in parallel')

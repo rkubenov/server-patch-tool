@@ -75,10 +75,13 @@ The `Installed` column refers only to the most recent install run: it is cleared
 The usual routine is to scan and install in parallel the day before, then reboot one server at a time during the window. "Patch Window..." (next to the reboot buttons) turns that into a single click the day before:
 
 1. Pick **All** or **Selected** servers. Put them in reboot order with **Up/Down**, and untick any server that should stay out.
-2. Leave **Scan and install now (parallel)** ticked, or untick it if the install is already done.
+2. Choose what runs now, under **Before the reboot**:
+   - **Scan and install now (parallel)** — the usual routine.
+   - **Scan only - the updates are already installed** — for servers patched outside this tool. Nothing is installed; the scan is what establishes which of them Windows is waiting to restart, and those are the ones the window reboots.
+   - **Nothing - use what the grid already says** — the reboot is decided from the last scan in the grid, however old it is.
 3. Pick the day and the time (24-hour, on this computer's clock), confirm the summary, then lock the screen.
 
-The scan and the parallel install start straight away, with the usual pre-flight, held-back KBs and password guard. When the time comes, the tool reboots one server at a time, in your order, and only servers whose `Reboot?` column says `Yes` at that moment. A server still installing or scanning at that point is skipped and logged, not rebooted mid-install. Each server that comes back is **scanned before the next one goes down**. A server that fails to reboot or does not come back within the reboot watch limit is logged and the queue moves on.
+Whatever was chosen starts straight away, with the usual pre-flight, held-back KBs and password guard. A pending reboot is read from the server itself, not from what this tool did: the scan reports one when the update agent says so **or** when the servicing stack's registry keys are set, which is how an update installed by hand — `wusa`, DISM, a vendor installer — shows up. When the time comes, the tool reboots one server at a time, in your order, and only servers whose `Reboot?` column says `Yes` at that moment. A server still installing or scanning at that point is skipped and logged, not rebooted mid-install. Each server that comes back is **scanned before the next one goes down**. A server that fails to reboot or does not come back within the reboot watch limit is logged and the queue moves on.
 
 At the end the log has a report: how many were rebooted, which ones are clean (post-reboot scan `Up to date`, no reboot pending), which need attention (updates still pending, offline, scan failed) and which were skipped, and why.
 
@@ -168,7 +171,7 @@ Parses the main file, loads the XAML markup (the main window, and the patch-wind
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File _tests.ps1
 ```
 
-Behavioural tests — 365 checks, no live server and no window required. The tool is a single file that builds a window as it loads, so it cannot simply be dot-sourced; instead each unit under test is located in the real file with the PowerShell parser and evaluated on its own against stubs. That way the shipped code is exercised rather than a copy of it, and a test fails loudly if the code it targets is renamed or moved.
+Behavioural tests — 374 checks, no live server and no window required. The tool is a single file that builds a window as it loads, so it cannot simply be dot-sourced; instead each unit under test is located in the real file with the PowerShell parser and evaluated on its own against stubs. That way the shipped code is exercised rather than a copy of it, and a test fails loudly if the code it targets is renamed or moved.
 
 Covered: the job completion timer, install reporting, credential selection, removal and password changes, the stale-password guard and the credential test, held-back updates and the install pre-flight, the post-reboot monitor and how it is launched, the sequential queues, deferred re-checks, both time limits, and the patch window (plan validation, who is rebooted and in what order, the phases and the reboot time, the scan-before-next hand-over, the morning report, saving and restoring the plan, and Stop disarming it).
 

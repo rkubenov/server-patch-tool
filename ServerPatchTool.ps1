@@ -1273,8 +1273,18 @@ try {
         }
     }
 
+    # The update agent's own flag only covers what the agent installed. Updates
+    # put on by hand - wusa, DISM, a vendor installer - leave the servicing
+    # stack's keys set instead, and a server patched that way reported "no
+    # reboot needed" while Windows was waiting for exactly that. Either source
+    # counts, which is also what the install pre-flight looks at.
     $sysInfo        = New-Object -ComObject Microsoft.Update.SystemInfo
-    $rebootRequired = $sysInfo.RebootRequired
+    $rebootRequired = [bool]$sysInfo.RebootRequired
+    foreach ($key in @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired')) {
+        if (Test-Path -LiteralPath $key) { $rebootRequired = $true }
+    }
 
     $result = @{
         Success        = $true
@@ -3015,11 +3025,18 @@ $script:PatchWindowBusy = @("Scanning...", "Checking...", "Installing...", "Stil
 # Validates what the dialog collected and turns it into a plan. Pure, so the
 # rules can be tested without a window.
 function New-PatchWindowPlan {
+    # -Mode is what to do now, before the reboot time:
+    #   ScanInstall - the usual: scan, then install in parallel.
+    #   ScanOnly    - the updates were put on by hand outside this tool; the
+    #                 scan is still needed, because it is what tells the window
+    #                 which servers Windows is waiting to restart.
+    #   None        - nothing now; the grid already says who needs a reboot.
     param(
         [datetime]$Day,
         [string]$TimeText,
         [string[]]$Servers,
-        [bool]$Prepare,
+        [ValidateSet('ScanInstall', 'ScanOnly', 'None')]
+        [string]$Mode = 'ScanInstall',
         [datetime]$Now = (Get-Date)
     )
     $fail = { param($Why) [PSCustomObject]@{ Ok = $false; Error = $Why; Plan = $null } }
@@ -3049,10 +3066,11 @@ function New-PatchWindowPlan {
     $plan = [PSCustomObject]@{
         RebootAt   = $at
         Servers    = [string[]]$list.ToArray()
-        Prepare    = $Prepare
-        Phase      = if ($Prepare) { 'Scanning' } else { 'Waiting' }
+        Mode       = $Mode
+        Phase      = if ($Mode -eq 'None') { 'Waiting' } else { 'Scanning' }
         CreatedAt  = $Now
         Queued     = @()
+        # Filled in when the reboots start; see Start-PatchWindowReboot.
         Skipped    = @()
         WaitLogged = $false
     }
@@ -3147,10 +3165,10 @@ function Get-PatchWindowSummary {
     param($Plan)
     $n     = @($Plan.Servers).Count
     $lines = New-Object System.Collections.Generic.List[string]
-    if ($Plan.Prepare) {
-        $lines.Add("Now: scan the $n server(s) below, then install updates on them in parallel.") | Out-Null
-    } else {
-        $lines.Add("Nothing is started now - the scan and install are assumed done.") | Out-Null
+    switch ($Plan.Mode) {
+        'ScanInstall' { $lines.Add("Now: scan the $n server(s) below, then install updates on them in parallel.") | Out-Null }
+        'ScanOnly'    { $lines.Add("Now: scan the $n server(s) below, to see which of them Windows is waiting to restart. Nothing is installed.") | Out-Null }
+        default       { $lines.Add("Nothing is started now - the reboot uses what the grid already says.") | Out-Null }
     }
     $lines.Add("") | Out-Null
     $lines.Add("At $($Plan.RebootAt.ToString('dddd dd.MM.yyyy HH:mm')): reboot one by one, in this order, the ones that need a reboot by then:") | Out-Null
@@ -3208,7 +3226,7 @@ function Read-PatchWindow {
         return [PSCustomObject]@{
             RebootAt   = (& $toDate $raw.RebootAt)
             Servers    = [string[]]$servers
-            Prepare    = $false
+            Mode       = 'None'
             Phase      = 'Waiting'
             CreatedAt  = (& $toDate $raw.CreatedAt)
             Queued     = @()
@@ -3237,11 +3255,13 @@ function Start-PatchWindow {
     Save-PatchWindow
     Write-Log "Patch window set: sequential reboot at $($Plan.RebootAt.ToString('dd.MM.yyyy HH:mm')) - order: $(@($Plan.Servers) -join ', ')"
 
-    if ($Plan.Prepare) {
+    if ($Plan.Mode -ne 'None') {
+        $count = @($Plan.Servers).Count
+        $why   = if ($Plan.Mode -eq 'ScanOnly') { "to see which ones need a reboot" } else { "before the install" }
         Sync-RunspacePool
-        Start-ProgressBatch -Total @($Plan.Servers).Count
-        Update-StatusBar "Patch window: scanning $(@($Plan.Servers).Count) server(s)..."
-        Write-Log "Patch window: scanning $(@($Plan.Servers).Count) server(s) before the install"
+        Start-ProgressBatch -Total $count
+        Update-StatusBar "Patch window: scanning $count server(s)..."
+        Write-Log "Patch window: scanning $count server(s) $why"
         foreach ($name in $Plan.Servers) { Invoke-ScanServer -ServerName $name }
     }
     Update-PatchWindowBanner
@@ -3352,7 +3372,19 @@ function Step-PatchWindow {
         if ($Now -ge $pw.RebootAt) {
             Start-PatchWindowReboot
         } elseif ($pw.Phase -eq 'Scanning') {
-            if (-not (Test-PatchWindowBusy -Statuses @("Scanning..."))) { Start-PatchWindowInstall }
+            if (-not (Test-PatchWindowBusy -Statuses @("Scanning..."))) {
+                if ($pw.Mode -eq 'ScanOnly') {
+                    # Nothing to install: the updates went on outside this tool,
+                    # and the scan has just established who is waiting to restart.
+                    $pw.Phase = 'Waiting'
+                    Save-PatchWindow
+                    $need = @((Get-PatchWindowRebootList -Servers $pw.Servers).Reboot).Count
+                    Write-Log "Patch window: scan finished - $need server(s) need a reboot; sequential reboot at $($pw.RebootAt.ToString('dd.MM HH:mm'))"
+                    Update-StatusBar "Patch window: scan finished - waiting for $($pw.RebootAt.ToString('dd.MM HH:mm'))"
+                } else {
+                    Start-PatchWindowInstall
+                }
+            }
         } elseif ($pw.Phase -eq 'Installing') {
             # Scanning counts too: a clean install is confirmed by a rescan.
             if (-not (Test-PatchWindowBusy -Statuses @("Checking...", "Installing...", "Scanning..."))) {
@@ -3486,9 +3518,18 @@ $script:PatchWindowXaml = @'
             </StackPanel>
         </Grid>
 
-        <CheckBox Grid.Row="3" x:Name="chkPwPrepare" IsChecked="True" Margin="0,0,0,10"
-                  Content="Scan and install now (parallel)"
-                  ToolTip="Untick if the install has already been done and only the reboots are left"/>
+        <StackPanel Grid.Row="3" Margin="0,0,0,10">
+            <TextBlock Text="Before the reboot:" Foreground="#a6adc8" Margin="0,0,0,4"/>
+            <RadioButton x:Name="rbPwScanInstall" Content="Scan and install now (parallel)" IsChecked="True"
+                         Foreground="#cdd6f4" Margin="0,2" VerticalContentAlignment="Center"
+                         ToolTip="The usual routine: find the missing updates and install them now"/>
+            <RadioButton x:Name="rbPwScanOnly" Content="Scan only - the updates are already installed"
+                         Foreground="#cdd6f4" Margin="0,2" VerticalContentAlignment="Center"
+                         ToolTip="For servers patched outside this tool. The scan is what finds out which of them Windows is waiting to restart."/>
+            <RadioButton x:Name="rbPwNothing" Content="Nothing - use what the grid already says"
+                         Foreground="#cdd6f4" Margin="0,2" VerticalContentAlignment="Center"
+                         ToolTip="Reboot decided from the last scan in the grid, however old it is"/>
+        </StackPanel>
 
         <StackPanel Grid.Row="4" Orientation="Horizontal" Margin="0,0,0,6">
             <TextBlock Text="Reboot on:" Foreground="#a6adc8" VerticalAlignment="Center" Margin="0,0,8,0"/>
@@ -3520,7 +3561,8 @@ function Show-PatchWindowDialog {
 
     $c = @{}
     foreach ($n in 'rbPwAll', 'rbPwSelected', 'lbPwServers', 'btnPwUp', 'btnPwDown',
-                   'chkPwPrepare', 'cboPwDay', 'txtPwTime', 'txtPwError', 'btnPwOk', 'btnPwCancel') {
+                   'rbPwScanInstall', 'rbPwScanOnly', 'rbPwNothing',
+                   'cboPwDay', 'txtPwTime', 'txtPwError', 'btnPwOk', 'btnPwCancel') {
         $c[$n] = $dlg.FindName($n)
     }
 
@@ -3580,8 +3622,11 @@ function Show-PatchWindowDialog {
 
     $c.btnPwOk.Add_Click({
         $names = @($items | Where-Object { $_.Include } | ForEach-Object { $_.ServerName })
+        $mode = if ($c.rbPwScanOnly.IsChecked) { 'ScanOnly' }
+                elseif ($c.rbPwNothing.IsChecked) { 'None' }
+                else { 'ScanInstall' }
         $r = New-PatchWindowPlan -Day $c.cboPwDay.SelectedItem.Tag -TimeText $c.txtPwTime.Text `
-                                 -Servers $names -Prepare ([bool]$c.chkPwPrepare.IsChecked)
+                                 -Servers $names -Mode $mode
         if (-not $r.Ok) { $c.txtPwError.Text = $r.Error; return }
         $state.Plan = $r.Plan
         $dlg.DialogResult = $true
