@@ -179,7 +179,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File _tests.ps1
 
 Behavioural tests — 384 checks, no live server and no window required. The tool is a single file that builds a window as it loads, so it cannot simply be dot-sourced; instead each unit under test is located in the real file with the PowerShell parser and evaluated on its own against stubs. That way the shipped code is exercised rather than a copy of it, and a test fails loudly if the code it targets is renamed or moved.
 
-Covered: the job completion timer, install reporting, credential selection, removal and password changes, the stale-password guard and the credential test, held-back updates and the install pre-flight, the post-reboot monitor and how it is launched, the sequential queues, deferred re-checks, both time limits, and the patch window (plan validation, who is rebooted and in what order, the phases and the reboot time, the scan-before-next hand-over, the morning report, saving and restoring the plan, and Stop disarming it).
+Covered: the job completion timer, install reporting, credential selection, removal and password changes, the stale-password guard and the credential test, held-back updates and the install pre-flight, the post-reboot monitor and how it is launched, the sequential queues, deferred re-checks, both time limits, and the patch window (plan validation and its three modes, who is rebooted and in what order, the phases and the reboot time, the scan-before-next hand-over, the morning report, saving and restoring the plan — mode included, and older files without one — and Stop disarming it).
 
 > [!IMPORTANT]
 > `.ps1` files are stored **without a BOM**, so PowerShell 5.1 reads them in the system's single-byte code page. Code and strings must stay ASCII. The validator checks this.
@@ -203,6 +203,8 @@ Anything a callback needs to do therefore belongs in a named function. Function 
 - **No per-server locking.** Nothing stops a scan from being started against a server that is currently installing. Task and file names are unique per run, so nothing is corrupted; the update agent serialises the work and the second operation fails with a confusing error.
 - **Nothing survives closing the window** except a scheduled patch window, which is offered again at the next start. In-flight monitoring, sequential queues and deferred re-checks are all lost. Work already handed to a server carries on there regardless.
 - **One file, including the XAML.** Splitting it up would make more of it testable.
+- **A patch window reboots only what the last scan says.** With **Nothing** chosen, or after restoring an overdue plan — where **Yes** means reboot now, so no scan runs first — a server patched since that scan reads `Reboot? = No` and is skipped. The countdown shows this before the night does: `0 of 5 need a reboot`.
+- **A patch window does not reschedule itself.** If it ends with servers still needing a reboot — one that never came back, one skipped as busy — that is in the morning report, and the next window is planned by hand.
 - The grid rebuilds rows through `RemoveAt`/`Insert` rather than `INotifyPropertyChanged`, so it flickers on update.
 - `Get-StatusColor` is dead code: defined, never called.
 - **Several paths have not come up in practice yet.** Each is covered by the tests, and none has been exercised against a live server:
@@ -210,7 +212,8 @@ Anything a callback needs to do therefore belongs in a named function. Function 
   - the deferred re-checks that follow an install time-out;
   - the stale-password guard actually halting a run, including how well `Test-AuthFailure` recognises the wording the domain controllers really use - a formulation it does not match simply means the guard stays quiet;
   - holding a KB back, end to end, as far as the server skipping it;
-  - the patch window, end to end: the timed start, the scan-before-next hand-over, and restoring a saved plan. The dialog itself has been driven by a script (reordering, unticking, a bad time refused) and the prompts have been read from screenshots, but neither through a real window. The prompts' default buttons are not covered by the tests;
+  - the patch window, end to end: the timed start, the scan-before-next hand-over, and restoring a saved plan — including the rescan a restored scan plan performs. The dialog itself has been driven by a script (reordering, unticking, a bad time refused) and the prompts have been read from screenshots, but neither through a real window. The prompts' default buttons are not covered by the tests;
+  - the wider pending-reboot check. The scan now reports a reboot from `Component Based Servicing\RebootPending` and `WindowsUpdate\Auto Update\RebootRequired` as well as the update agent's flag. That code runs on the server, so the tests cannot reach it: a server patched by hand is the case to watch the first time;
   - the pre-flight blocking an install. Its 8 GB free-space threshold is an estimate for cumulative updates, not a measured figure for this estate: a server that normally runs closer to the line will start being blocked where it used to install.
 
 
