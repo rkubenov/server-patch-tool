@@ -3199,6 +3199,7 @@ function Save-PatchWindow {
         ConvertTo-Json -Depth 3 -InputObject @{
             RebootAt  = $pw.RebootAt.ToString('o')
             Servers   = @($pw.Servers)
+            Mode      = $pw.Mode
             Phase     = $pw.Phase
             CreatedAt = $pw.CreatedAt.ToString('o')
         } | Set-Content -Path $script:PatchWindowFile -Encoding UTF8 -Force
@@ -3207,8 +3208,9 @@ function Save-PatchWindow {
     }
 }
 
-# The plan saved by an earlier session, or $null. It always comes back as
-# Waiting: whatever scans or installs it had started died with that session.
+# The plan saved by an earlier session, or $null. Whatever it had running died
+# with that session; a plan that scanned comes back ready to scan again, any
+# other comes back waiting for its reboot time.
 function Read-PatchWindow {
     if (-not (Test-Path -LiteralPath $script:PatchWindowFile)) { return $null }
     try {
@@ -3223,11 +3225,16 @@ function Read-PatchWindow {
             if ($d.Kind -eq [DateTimeKind]::Utc) { $d.ToLocalTime() } else { $d } }
         $servers = @(@($raw.Servers) | Where-Object { $_ } | ForEach-Object { [string]$_ })
         if ($servers.Count -eq 0) { throw "it lists no servers" }
+        # A restored plan never installs - that decision belongs to the session
+        # that is gone. A plan that scanned, though, is restored as a scan: the
+        # grid it would otherwise trust is as old as the session that closed,
+        # and on servers patched by hand in between it is simply wrong.
+        $mode = if ("$($raw.Mode)" -in @('ScanOnly', 'ScanInstall')) { 'ScanOnly' } else { 'None' }
         return [PSCustomObject]@{
             RebootAt   = (& $toDate $raw.RebootAt)
             Servers    = [string[]]$servers
-            Mode       = 'None'
-            Phase      = 'Waiting'
+            Mode       = $mode
+            Phase      = if ($mode -eq 'ScanOnly') { 'Scanning' } else { 'Waiting' }
             CreatedAt  = (& $toDate $raw.CreatedAt)
             Queued     = @()
             Skipped    = @()
@@ -3250,10 +3257,11 @@ function Clear-PatchWindow {
 }
 
 function Start-PatchWindow {
-    param($Plan)
+    param($Plan, [switch]$Restored)
     $script:PatchWindow = $Plan
     Save-PatchWindow
-    Write-Log "Patch window set: sequential reboot at $($Plan.RebootAt.ToString('dd.MM.yyyy HH:mm')) - order: $(@($Plan.Servers) -join ', ')"
+    $what = if ($Restored) { "restored" } else { "set" }
+    Write-Log "Patch window ${what}: sequential reboot at $($Plan.RebootAt.ToString('dd.MM.yyyy HH:mm')) - order: $(@($Plan.Servers) -join ', ')"
 
     if ($Plan.Mode -ne 'None') {
         $count = @($Plan.Servers).Count
@@ -3407,7 +3415,11 @@ function Resume-PatchWindow {
     $when = $saved.RebootAt.ToString('dd.MM.yyyy HH:mm')
     $list = @($saved.Servers) -join ', '
     if ($saved.RebootAt -gt (Get-Date)) {
-        $text    = "A patch window was scheduled before the tool was closed:`n`nSequential reboot at $when of those that need it, in this order:`n$list`n`nRestore it?`n`nNo discards it."
+        # A plan that scanned is scanned again on restore: the grid is as old as
+        # the session that closed, and a server patched by hand since then would
+        # otherwise read "no reboot needed" and be skipped.
+        $rescan  = if ($saved.Mode -eq 'ScanOnly') { "`n`nThe servers are scanned again now, so one patched since the tool closed is not missed. Nothing is installed." } else { "" }
+        $text    = "A patch window was scheduled before the tool was closed:`n`nSequential reboot at $when of those that need it, in this order:`n$list$rescan`n`nRestore it?`n`nNo discards it."
         $icon    = [System.Windows.MessageBoxImage]::Question
         $default = [System.Windows.MessageBoxResult]::Yes
     } else {
@@ -3420,10 +3432,13 @@ function Resume-PatchWindow {
     $answer = [System.Windows.MessageBox]::Show($text, "Patch Window",
         [System.Windows.MessageBoxButton]::YesNo, $icon, $default)
     if ($answer -eq "Yes") {
-        $script:PatchWindow = $saved
-        Save-PatchWindow
-        Write-Log "Patch window restored: sequential reboot at $when - order: $list"
-        Update-PatchWindowBanner
+        # An overdue plan is not scanned first: Yes there means "reboot now",
+        # and the reboot starts on the next tick whatever the phase says.
+        if ($saved.Mode -eq 'ScanOnly' -and $saved.RebootAt -le (Get-Date)) {
+            $saved.Mode  = 'None'
+            $saved.Phase = 'Waiting'
+        }
+        Start-PatchWindow -Plan $saved -Restored
     } else {
         Remove-Item -LiteralPath $script:PatchWindowFile -Force -ErrorAction SilentlyContinue
         Write-Log "Saved patch window for $when discarded"

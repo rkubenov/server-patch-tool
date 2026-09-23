@@ -1473,7 +1473,7 @@ Check "the summary is not a warning"           ((Get-LoggedLike 'INFO|Patch wind
 
 Case "a plan survives a restart, one server included"
 Reset-Pw
-$script:PatchWindow = New-TestPlan -Servers @('SRV-A')
+$script:PatchWindow = New-TestPlan -Servers @('SRV-A') -Mode 'ScanInstall'
 $script:PatchWindow.Phase = 'Installing'
 Save-PatchWindow
 $script:PatchWindow = $null
@@ -1481,7 +1481,52 @@ $back = Read-PatchWindow
 Check "it was read back"                       ($null -ne $back)
 Check "the reboot time is exact"               ($back.RebootAt -eq $pwAt)
 Check "the single server is whole"             ((@($back.Servers).Count -eq 1) -and ($back.Servers[0] -eq 'SRV-A'))
-Check "it comes back waiting - its jobs died with the session" ($back.Phase -eq 'Waiting')
+Check "it comes back ready to scan, not to install" (($back.Phase -eq 'Scanning') -and ($back.Mode -eq 'ScanOnly'))
+
+Case "a restored plan never installs, whatever it was doing"
+foreach ($m in 'ScanInstall', 'ScanOnly') {
+    Reset-Pw
+    $script:PatchWindow = New-TestPlan -Servers @('SRV-A') -Mode $m
+    Save-PatchWindow
+    Check "a $m plan comes back as a scan"     ((Read-PatchWindow).Mode -eq 'ScanOnly')
+}
+Reset-Pw
+$script:PatchWindow = New-TestPlan -Servers @('SRV-A') -Mode 'None'
+Save-PatchWindow
+$back = Read-PatchWindow
+Check "a plan that ran nothing still runs nothing" ($back.Mode -eq 'None')
+Check "and waits for its reboot time"          ($back.Phase -eq 'Waiting')
+
+Case "a file written before modes existed is still read"
+Reset-Pw
+Set-Content -LiteralPath $script:PatchWindowFile -Encoding UTF8 -Value (@{
+    RebootAt  = $pwAt.ToString('o')
+    CreatedAt = $pwNow.ToString('o')
+    Phase     = 'Waiting'
+    Servers   = @('SRV-A')
+} | ConvertTo-Json)
+$back = Read-PatchWindow
+Check "it loads"                               ($null -ne $back)
+Check "with no mode, nothing is run"           ($back.Mode -eq 'None')
+
+Case "a restored scan plan scans again before the reboot time"
+Reset-Pw
+Set-PwGrid @(
+    @('SRV-A', 'Interrupted', '-'),
+    @('SRV-B', 'Interrupted', '-'))
+$restored = New-TestPlan -Servers @('SRV-A','SRV-B') -Mode 'ScanOnly'
+$restored.Phase = 'Scanning'
+$script:PatchWindow = $restored
+Set-PwRow 'SRV-A' 'Scanning...' '-'
+Step-PatchWindow -Now $pwNow
+Check "it waits for the scan"                  ($script:PatchWindow.Phase -eq 'Scanning')
+Check "and installs nothing"                   ($script:Installed.Count -eq 0)
+Set-PwRow 'SRV-A' 'Up to date' 'Yes'
+Set-PwRow 'SRV-B' 'Up to date' 'No'
+Step-PatchWindow -Now $pwNow
+Check "then waits for the reboot time"         ($script:PatchWindow.Phase -eq 'Waiting')
+Step-PatchWindow -Now $pwAt
+Check "the server patched since is rebooted"   ($script:RebootStarted -contains 'SRV-A')
 
 Case "a time taken from this computer's clock is not shifted by its zone"
 # The dialog's dates come from Get-Date and carry the local zone; they are

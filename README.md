@@ -109,7 +109,7 @@ At start-up, a saved plan gets a fifth prompt. If its time is still ahead, it of
 Other things to know:
 
 - **The tool has to stay open.** A locked screen is fine. Logging off, closing the window, or the workstation restarting (watch for its own Windows Update) means nothing happens at the reboot time.
-- **The plan is saved** to `%LOCALAPPDATA%\ServerPatchTool\patch-window.json`. If the tool was closed, the next start offers to restore it; if the time has already passed, it asks whether to start the reboots now. Scans or installs still in progress when the tool closed are not resumed.
+- **The plan is saved** to `%LOCALAPPDATA%\ServerPatchTool\patch-window.json`, mode included. If the tool was closed, the next start offers to restore it; if the time has already passed, it asks whether to start the reboots now. A restored plan never installs — that decision belonged to the session that is gone — but one whose mode included a scan is **scanned again on restore**, because the grid it would otherwise trust is as old as the closed session, and a server patched by hand in between would read `Reboot? = No` and be skipped. An overdue plan is not scanned first: **Yes** there means reboot now. Scans or installs that were in progress when the tool closed are not resumed.
 - **Stop** also cancels the plan, and so does the password guard halting a run.
 - A reboot run started by hand when the time comes is not interrupted. The window waits for it to finish.
 
@@ -177,7 +177,7 @@ Parses the main file, loads the XAML markup (the main window, and the patch-wind
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File _tests.ps1
 ```
 
-Behavioural tests — 374 checks, no live server and no window required. The tool is a single file that builds a window as it loads, so it cannot simply be dot-sourced; instead each unit under test is located in the real file with the PowerShell parser and evaluated on its own against stubs. That way the shipped code is exercised rather than a copy of it, and a test fails loudly if the code it targets is renamed or moved.
+Behavioural tests — 384 checks, no live server and no window required. The tool is a single file that builds a window as it loads, so it cannot simply be dot-sourced; instead each unit under test is located in the real file with the PowerShell parser and evaluated on its own against stubs. That way the shipped code is exercised rather than a copy of it, and a test fails loudly if the code it targets is renamed or moved.
 
 Covered: the job completion timer, install reporting, credential selection, removal and password changes, the stale-password guard and the credential test, held-back updates and the install pre-flight, the post-reboot monitor and how it is launched, the sequential queues, deferred re-checks, both time limits, and the patch window (plan validation, who is rebooted and in what order, the phases and the reboot time, the scan-before-next hand-over, the morning report, saving and restoring the plan, and Stop disarming it).
 
