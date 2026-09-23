@@ -14,7 +14,7 @@ A PowerShell + WPF desktop tool for driving Windows Updates across domain-joined
 - Several credential sets, for different domains, bound to individual servers, with in-place password changes
 - A stale stored password is caught before a run, and stops one before it locks the account
 - Named updates held back across every install, and a pre-flight that refuses an install that cannot succeed
-- A patch window: scan and install now, then reboot one by one, in your order, at a time you choose
+- A patch window: scan and install now, then reboot one by one, in your order, at a time you choose — including servers patched outside this tool, which only need the reboot
 - Export results to CSV
 
 ## Requirements
@@ -83,9 +83,15 @@ The usual routine is to scan and install in parallel the day before, then reboot
 
 Whatever was chosen starts straight away, with the usual pre-flight, held-back KBs and password guard. A pending reboot is read from the server itself, not from what this tool did: the scan reports one when the update agent says so **or** when the servicing stack's registry keys are set, which is how an update installed by hand — `wusa`, DISM, a vendor installer — shows up. When the time comes, the tool reboots one server at a time, in your order, and only servers whose `Reboot?` column says `Yes` at that moment. A server still installing or scanning at that point is skipped and logged, not rebooted mid-install. Each server that comes back is **scanned before the next one goes down**. A server that fails to reboot or does not come back within the reboot watch limit is logged and the queue moves on.
 
+### Servers patched outside this tool
+
+Updates put on by hand still leave Windows waiting for a restart, and that restart can be scheduled here. Plan the window as usual, but choose **Scan only** — those servers have nothing left to install, and the scan is what finds the pending reboot. It is not optional: with **Nothing** the window only sees whatever the last scan left in the grid, so a server patched since then reads `Reboot? = No` and is skipped, which shows up in the log as `no server needs a reboot` and in the countdown as `0 of N need a reboot`.
+
+The scan finds such a reboot because it does not go by what this tool installed. It reports one when the update agent's own flag is set **or** when either servicing-stack key is — `Component Based Servicing\RebootPending` or `WindowsUpdate\Auto Update\RebootRequired` — which is what `wusa`, DISM and vendor installers leave behind. The install pre-flight reads the same two keys.
+
 At the end the log has a report: how many were rebooted, which ones are clean (post-reboot scan `Up to date`, no reboot pending), which need attention (updates still pending, offline, scan failed) and which were skipped, and why.
 
-While a plan is armed, the status bar shows a countdown next to a **Cancel** button: `Patch window: waiting - reboot Wed 23.09 02:00 (in 7 h 13 min), 4 of 5 need a reboot`. While the scan and install run it counts the servers in the plan; once they are done it counts the ones that will actually go down, by the same rule the reboot itself applies. During the reboots it reads `sequential reboot in progress`, and Cancel is disabled — **Stop** is what ends a run that has begun.
+While a plan is armed, the status bar shows a countdown next to a **Cancel** button: `Patch window: waiting - reboot Wed 23.09 02:00 (in 7 h 13 min), 4 of 5 need a reboot`. While the scan or install runs it counts the servers in the plan; once they are done it counts the ones that will actually go down, by the same rule the reboot itself applies. During the reboots it reads `sequential reboot in progress`, and Cancel is disabled — **Stop** is what ends a run that has begun.
 
 ### The prompts, and what Enter does
 
