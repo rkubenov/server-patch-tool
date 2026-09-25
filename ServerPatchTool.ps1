@@ -3272,6 +3272,13 @@ $script:AttentionStatuses = @("Error", "Blocked", "Offline", "Partially Online",
                               "Completed with errors", "Still installing", "Reboot issued",
                               "Rebooting (unmonitored)", "Interrupted")
 
+# Statuses that mean the run is not over yet. Deliberately not
+# $script:PatchWindowBusy: that one counts "Still installing" as busy, because
+# the window must not reboot a server mid-install. Here it is the opposite - an
+# install that ran past its limit is the result, and the report that says so
+# must not be the one thing the timeout suppresses.
+$script:BatchWatchBusy = @("Scanning...", "Checking...", "Installing...", "Rebooting...")
+
 function Start-BatchWatch {
     param([string]$Kind, [string]$Label, [string[]]$Servers)
     # Nothing to report to: do not carry state nobody reads.
@@ -3328,7 +3335,7 @@ function Step-BatchWatch {
     if ($script:ActiveJobs.Count -gt 0) { return $false }
     foreach ($name in $w.Servers) {
         $entry = $script:ServerData | Where-Object { $_.ServerName -eq $name } | Select-Object -First 1
-        if ($entry -and $entry.Status -in $script:PatchWindowBusy) { return $false }
+        if ($entry -and $entry.Status -in $script:BatchWatchBusy) { return $false }
     }
 
     $script:BatchWatch = $null

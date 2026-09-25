@@ -131,7 +131,7 @@ The body repeats the summary, then one line per server that needs looking at —
 - **Nothing blocks a run.** Sending happens in the same runspace pool as everything else, so a relay that does not answer costs no time in the window, and a refused message is a `WARN` in the log — never a failed run. The report is in the log either way.
 - **Send test** uses the settings on screen and the same code path as the real mail, so a relay that would refuse the night's message refuses the test too.
 - **Settings that cannot work are refused when saved**, not at 2 a.m.: no server, a port that is not a number, an address without an `@`, no recipient, or a user name with no password.
-- **A parallel run has no single end**, so the tool watches it the way it watches a patch window: the mail goes out once nothing in the batch is busy and no confirming scan or reboot watch is still out. Pressing **Stop** cancels the report — a stopped run has no result worth mailing.
+- **A parallel run has no single end**, so the tool watches it the way it watches a patch window: the mail goes out once nothing in the batch is busy and no confirming scan or reboot watch is still out. A server that ran past the install limit counts as finished for the report and is listed as needing attention — waiting for it would hold back the very message that says an install is still running. Pressing **Stop** cancels the report — a stopped run has no result worth mailing.
 - **What leaves the machine:** server names, statuses, KB numbers. Fine for an internal relay; worth a thought if the mail goes to a cloud mailbox.
 
 ## Where data lives
@@ -199,7 +199,7 @@ Parses the main file, loads the XAML markup (the main window, and the patch-wind
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File _tests.ps1
 ```
 
-Behavioural tests — 456 checks, no live server and no window required. The tool is a single file that builds a window as it loads, so it cannot simply be dot-sourced; instead each unit under test is located in the real file with the PowerShell parser and evaluated on its own against stubs. That way the shipped code is exercised rather than a copy of it, and a test fails loudly if the code it targets is renamed or moved.
+Behavioural tests — 460 checks, no live server and no window required. The tool is a single file that builds a window as it loads, so it cannot simply be dot-sourced; instead each unit under test is located in the real file with the PowerShell parser and evaluated on its own against stubs. That way the shipped code is exercised rather than a copy of it, and a test fails loudly if the code it targets is renamed or moved.
 
 Covered: the job completion timer, install reporting, credential selection, removal and password changes, the stale-password guard and the credential test, held-back updates and the install pre-flight, the post-reboot monitor and how it is launched, the sequential queues, deferred re-checks, both time limits, and the patch window (plan validation and its three modes, who is rebooted and in what order, the phases and the reboot time, the scan-before-next hand-over, the morning report, saving and restoring the plan — mode included, and older files without one — and Stop disarming it), and the email notifications (settings validation and storage, which events are sent, the message an operator gets, when a run counts as finished, and a refused send staying a warning).
 

@@ -1765,6 +1765,7 @@ foreach ($fn in 'New-SmtpConfig', 'Test-SmtpConfig', 'ConvertTo-Recipients', 'Sa
     Invoke-Expression (Get-FunctionText -Name $fn)
 }
 Invoke-Expression (Get-AssignmentText -VariablePath '$script:AttentionStatuses')
+Invoke-Expression (Get-AssignmentText -VariablePath '$script:BatchWatchBusy')
 
 $mailDir = Join-Path $env:TEMP ("spt-mail-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $mailDir -Force | Out-Null
@@ -1956,6 +1957,20 @@ Check "as the install event"                   ($script:Sent[0].Event -eq 'Insta
 Check "with the summary"                       ($script:Sent[0].Summary -match 'Install all \(parallel\) finished')
 Check "the summary is in the log too"          ((Get-LoggedLike '*Install all (parallel) finished*').Count -eq 1)
 Check "and the watch is done"                  (-not (Step-BatchWatch))
+
+Case "an install that ran past its limit is still reported"
+# The case the report exists for: nobody is watching, and the one status that
+# most needs mailing must not be the one that holds the mail back for good.
+Reset-Watch
+$script:Smtp = New-TestSmtp -Events @{ Install = $true }
+Set-PwGrid @(
+    @('SRV-A', 'Completed',        'Yes'),
+    @('SRV-B', 'Still installing', '-'))
+Check "a timed-out install is not busy"        (-not ('Still installing' -in $script:BatchWatchBusy))
+Check "though the window still treats it so"   ('Still installing' -in $script:PatchWindowBusy)
+Start-BatchWatch -Kind 'Install' -Label 'Install all (parallel)' -Servers @('SRV-A','SRV-B') | Out-Null
+Check "the run is reported"                    (Step-BatchWatch)
+Check "and the server is named"                (($script:Sent[0].Lines -join "`n") -match 'SRV-B : Still installing')
 
 Case "a sequential run is not reported between servers"
 Reset-Watch
