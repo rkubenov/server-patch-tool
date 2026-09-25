@@ -140,8 +140,18 @@ function Step-PendingRechecks { }
 # down; here it only has to exist, so the tick can be tested on its own terms.
 function Register-JobAuthOutcome { param($Result) }
 function Step-AuthLockdown { }
-# Likewise the patch window, which the tick drives; tested in its own section.
+# Likewise the patch window and the run report, which the tick drives; both are
+# tested in sections of their own.
 function Step-PatchWindow { }
+function Step-BatchWatch { }
+# Email is opt-in and off in these tests, so the hooks that call it are exercised
+# without a relay. The real one has a section of its own.
+$script:Sent = @()
+function Send-Notification {
+    param([string]$Event, [string]$Summary, [string[]]$Lines = @())
+    $script:Sent += [PSCustomObject]@{ Event = $Event; Summary = $Summary; Lines = $Lines }
+    return $false
+}
 
 function Get-LoggedLike { param([string]$Pattern) @($script:Logged | Where-Object { $_ -like $Pattern }) }
 
@@ -1738,6 +1748,235 @@ Check "the scan gate is lifted"                (-not $script:RebootVerifyScan)
 Check "the log says why"                       ((Get-LoggedLike 'WARN|*cancelled: Stopped by user*').Count -eq 1)
 
 Remove-Item -LiteralPath $pwDir -Recurse -Force -ErrorAction SilentlyContinue
+
+
+# =============================================================================
+Section "Email notifications"
+# A night window nobody reads is a night window nobody trusts. What matters
+# here: settings that would not work are refused before the night rather than
+# during it, only the chosen events are sent, and a relay that will not take
+# the mail never breaks the run it was reporting on.
+# =============================================================================
+Invoke-Expression (Get-AssignmentText -VariablePath '$script:NotifyEvents')
+foreach ($fn in 'New-SmtpConfig', 'Test-SmtpConfig', 'ConvertTo-Recipients', 'Save-SmtpConfig',
+                'Load-SmtpConfig', 'Test-NotificationEvent', 'New-NotificationMessage',
+                'Get-SmtpCredential', 'Send-Notification', 'Complete-Notification',
+                'Get-BatchReport', 'Start-BatchWatch', 'Step-BatchWatch') {
+    Invoke-Expression (Get-FunctionText -Name $fn)
+}
+Invoke-Expression (Get-AssignmentText -VariablePath '$script:AttentionStatuses')
+
+$mailDir = Join-Path $env:TEMP ("spt-mail-" + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $mailDir -Force | Out-Null
+$script:CredDir  = $mailDir
+$script:SmtpFile = Join-Path $mailDir 'smtp.json'
+$script:SmtpSendScript = { param($a) }
+
+function New-TestSmtp {
+    param([bool]$Enabled = $true, [string]$Server = 'relay.test.local', $Port = 25,
+          [string]$From = 'spt@test.local', [string[]]$To = @('ops@test.local'),
+          [string]$AuthUser = '', $Password = $null, [hashtable]$Events = $null)
+    $c = New-SmtpConfig
+    $c.Enabled = $Enabled; $c.Server = $Server; $c.Port = $Port
+    $c.From = $From; $c.To = $To; $c.AuthUser = $AuthUser; $c.Password = $Password
+    if ($Events) { foreach ($k in $Events.Keys) { $c.Events[$k] = $Events[$k] } }
+    return $c
+}
+function New-TestSecret {
+    param([string]$Text = 'p@ssw0rd')
+    ConvertTo-SecureString $Text -AsPlainText -Force
+}
+
+Case "settings that would work are accepted"
+$v = Test-SmtpConfig -Config (New-TestSmtp)
+Check "an anonymous relay is fine"             ($v.Ok)
+Check "with nothing to complain about"         ($v.Problems.Count -eq 0)
+Check "so is one with a user and password"     ((Test-SmtpConfig -Config (New-TestSmtp -AuthUser 'svc-mail' -Password (New-TestSecret))).Ok)
+
+Case "settings that would fail at 2 a.m. are refused now"
+$v = Test-SmtpConfig -Config (New-TestSmtp -Server '')
+Check "no server is refused"                   ((-not $v.Ok) -and ($v.Problems -join ' ') -match 'SMTP server is empty')
+$v = Test-SmtpConfig -Config (New-TestSmtp -Port 'twenty-five')
+Check "a port that is not a number is refused" ((-not $v.Ok) -and ($v.Problems -join ' ') -match 'not a port number')
+Check "so is one out of range"                 (-not (Test-SmtpConfig -Config (New-TestSmtp -Port 70000)).Ok)
+$v = Test-SmtpConfig -Config (New-TestSmtp -From 'patchtool')
+Check "a From that is not an address"          ((-not $v.Ok) -and ($v.Problems -join ' ') -match 'not an email address')
+$v = Test-SmtpConfig -Config (New-TestSmtp -To @())
+Check "no recipient is refused"                ((-not $v.Ok) -and ($v.Problems -join ' ') -match 'no recipient')
+$v = Test-SmtpConfig -Config (New-TestSmtp -To @('ops@test.local', 'bad address'))
+Check "one bad recipient among good ones"      (-not $v.Ok)
+$v = Test-SmtpConfig -Config (New-TestSmtp -AuthUser 'svc-mail')
+Check "a user with no password is refused"     ((-not $v.Ok) -and ($v.Problems -join ' ') -match 'no password')
+Check "nothing at all is refused"              (-not (Test-SmtpConfig -Config $null).Ok)
+
+Case "recipients are taken however they are typed"
+$r = ConvertTo-Recipients -Text ' a@x.local, b@x.local;c@x.local , a@x.local '
+Check "split, trimmed and de-duplicated"       (($r -join ',') -eq 'a@x.local,b@x.local,c@x.local')
+Check "one address is still a list"            ((@(ConvertTo-Recipients -Text 'only@x.local').Count -eq 1))
+$none = ConvertTo-Recipients -Text '  '
+Check "an empty box is no recipients"          (@($none).Count -eq 0)
+
+Case "only the chosen events are sent"
+$script:Smtp = New-TestSmtp -Events @{ PatchWindow = $true; Halt = $true; Install = $false; Reboot = $false }
+Check "the patch window report is on"          (Test-NotificationEvent -Event 'PatchWindow')
+Check "so is a halted run"                     (Test-NotificationEvent -Event 'Halt')
+Check "a hand-started install is off"          (-not (Test-NotificationEvent -Event 'Install'))
+Check "a hand-started reboot is off"           (-not (Test-NotificationEvent -Event 'Reboot'))
+
+Case "nothing is sent while email is switched off"
+$script:Smtp = New-TestSmtp -Enabled $false
+Check "not even a chosen event"                (-not (Test-NotificationEvent -Event 'PatchWindow'))
+
+Case "broken settings send nothing rather than failing every night"
+$script:Smtp = New-TestSmtp -Server ''
+Check "an unusable relay sends nothing"        (-not (Test-NotificationEvent -Event 'PatchWindow'))
+
+Case "the message reads like something an operator wants at 03:41"
+$m = New-NotificationMessage -Event 'PatchWindow' `
+    -Summary 'Patch window finished: 4 rebooted, 2 clean, 2 need attention, 1 skipped' `
+    -Lines @('needs attention - SRV-SQL01 : Available (1)', 'skipped - SRV-APP01 : no reboot needed') `
+    -Computer 'ADMIN-PC' -Now ([datetime]'2026-09-24 03:41:17')
+Check "the subject says what happened"         ($m.Subject -eq '[SPT] Patch window finished: 4 rebooted, 2 clean, 2 need attention, 1 skipped')
+Check "the body opens with the summary"        ($m.Body -match '^Patch window finished')
+Check "every line is in the body"              (($m.Body -match 'SRV-SQL01') -and ($m.Body -match 'SRV-APP01'))
+Check "it says which computer sent it"         ($m.Body -match 'ADMIN-PC')
+Check "and where the full log is"              ($m.Body -match 'ServerPatchTool_20260924\.log')
+
+Case "a subject too long for a phone is cut, not wrapped"
+$m = New-NotificationMessage -Event 'Install' -Summary ('x' * 400)
+Check "it is trimmed"                          ($m.Subject.Length -le 150)
+Check "and says it was trimmed"                ($m.Subject.EndsWith('...'))
+
+Case "the credential is only built when there is one"
+Check "anonymous means no credential"          ($null -eq (Get-SmtpCredential -Config (New-TestSmtp)))
+$cred = Get-SmtpCredential -Config (New-TestSmtp -AuthUser 'DOM\svc-mail' -Password (New-TestSecret))
+Check "a user and password make one"           ($cred -and $cred.UserName -eq 'DOM\svc-mail')
+Check "with the password intact"               ($cred.GetNetworkCredential().Password -eq 'p@ssw0rd')
+
+Case "settings survive a restart, password included"
+$script:Smtp = New-TestSmtp -AuthUser 'svc-mail' -Password (New-TestSecret -Text 'secret-123') `
+    -To @('a@x.local','b@x.local') -Events @{ Install = $true }
+$script:Smtp.UseSsl = $true
+$script:Smtp.Port = 587
+Save-SmtpConfig
+$back = Load-SmtpConfig
+Check "the relay is remembered"                (($back.Server -eq 'relay.test.local') -and ($back.Port -eq 587))
+Check "so is TLS"                              ($back.UseSsl)
+Check "both recipients come back"              ((@($back.To) -join ',') -eq 'a@x.local,b@x.local')
+Check "the chosen events come back"            ($back.Events.Install -and $back.Events.PatchWindow -and -not $back.Events.Reboot)
+Check "the password is usable again"           ((Get-SmtpCredential -Config $back).GetNetworkCredential().Password -eq 'secret-123')
+Check "and is not on disk in the clear"        (-not ((Get-Content -LiteralPath $script:SmtpFile -Raw) -match 'secret-123'))
+
+Case "one recipient is still a list after a restart"
+$script:Smtp = New-TestSmtp -To @('only@x.local')
+Save-SmtpConfig
+$back = Load-SmtpConfig
+Check "not its letters"                        ((@($back.To).Count -eq 1) -and ($back.To[0] -eq 'only@x.local'))
+
+Case "a damaged settings file is reported, not trusted"
+$script:Logged = @()
+Set-Content -LiteralPath $script:SmtpFile -Value '{ not json' -Encoding UTF8
+$back = Load-SmtpConfig
+Check "email ends up off"                      (-not $back.Enabled)
+Check "and it is logged"                       ((Get-LoggedLike 'WARN|*email settings could not be read*').Count -eq 1)
+
+Case "a relay that refuses the mail is a warning, not a failed run"
+$script:Logged = @()
+$script:Smtp = New-TestSmtp
+Check "it reports the send failed"             (-not (Complete-Notification -Result ([PSCustomObject]@{ Success = $false; Error = '5.7.1 Client was not authenticated' })))
+Check "the reason is in the log"               ((Get-LoggedLike 'WARN|*5.7.1 Client was not authenticated*').Count -eq 1)
+Check "never as an error"                      ((Get-LoggedLike 'ERROR|*').Count -eq 0)
+$script:Logged = @()
+Check "a job that returned nothing is handled" (-not (Complete-Notification -Result $null))
+Check "and says so"                            ((Get-LoggedLike 'WARN|*returned nothing*').Count -eq 1)
+$script:Logged = @()
+Check "a sent message is logged"               (Complete-Notification -Result ([PSCustomObject]@{ Success = $true }))
+Check "with the recipients"                    ((Get-LoggedLike 'INFO|*ops@test.local*').Count -eq 1)
+
+# -- What a finished run says -------------------------------------------------
+Case "an install report counts what still needs doing"
+Set-PwGrid @(
+    @('SRV-A', 'Reboot Required',       'Yes'),
+    @('SRV-B', 'Up to date',            'No'),
+    @('SRV-C', 'Completed with errors', 'Yes', 'KB5000001 (0x800F0922 - installer failed)'),
+    @('SRV-D', 'Blocked',               '-',   'only 3 GB free on the system drive'))
+$rep = Get-BatchReport -Kind 'Install' -Label 'Install all (parallel)' -Servers @('SRV-A','SRV-B','SRV-C','SRV-D')
+Check "the summary names the run"              ($rep.Summary -match '^Install all \(parallel\) finished')
+Check "it counts the servers"                  ($rep.Summary -match '4 server\(s\)')
+Check "and those needing attention"            ($rep.Summary -match '2 need attention')
+Check "and those awaiting a reboot"            ($rep.Summary -match '1 awaiting a reboot')
+Check "a blocked server is listed with why"    (($rep.Lines -join "`n") -match 'SRV-D : Blocked - only 3 GB free')
+Check "a partly failed install too"            (($rep.Lines -join "`n") -match 'SRV-C : Completed with errors')
+Check "the one awaiting a reboot is named"     (($rep.Lines -join "`n") -match 'awaiting a reboot: SRV-A')
+Check "a clean server is not in the mail"      (-not (($rep.Lines -join "`n") -match 'SRV-B'))
+
+Case "a reboot report does not talk about pending reboots"
+Set-PwGrid @(
+    @('SRV-A', 'Up to date', 'No'),
+    @('SRV-B', 'Offline',    'Pending', 'Server did not come back within 30 minutes.'))
+$rep = Get-BatchReport -Kind 'Reboot' -Label 'Reboot all (sequential)' -Servers @('SRV-A','SRV-B')
+Check "the summary names the run"              ($rep.Summary -match '^Reboot all \(sequential\) finished')
+Check "it counts what needs attention"         ($rep.Summary -match '1 need attention')
+Check "and says nothing about awaiting"        (-not ($rep.Summary -match 'awaiting'))
+Check "the server that did not come back"      (($rep.Lines -join "`n") -match 'SRV-B : Offline')
+
+Case "a server removed from the grid mid-run is still reported"
+$rep = Get-BatchReport -Kind 'Install' -Label 'Install selected' -Servers @('SRV-GONE')
+Check "it is not silently dropped"             (($rep.Lines -join "`n") -match 'SRV-GONE : no longer in the server list')
+
+# -- When the run counts as finished ------------------------------------------
+$script:ActiveJobs.Clear()
+$script:SequentialQueue.Clear()
+$script:RebootQueue.Clear()
+function Reset-Watch {
+    $script:Logged = @(); $script:Sent = @()
+    $script:ActiveJobs.Clear(); $script:SequentialQueue.Clear(); $script:RebootQueue.Clear()
+    $script:BatchWatch = $null
+}
+# The real Send-Notification is under test above; here the hook is watched.
+function Send-Notification {
+    param([string]$Event, [string]$Summary, [string[]]$Lines = @())
+    $script:Sent += [PSCustomObject]@{ Event = $Event; Summary = $Summary; Lines = $Lines }
+    return $true
+}
+
+Case "a run is only reported once everything has finished"
+Reset-Watch
+$script:Smtp = New-TestSmtp -Events @{ Install = $true }
+Set-PwGrid @(
+    @('SRV-A', 'Installing...', '-'),
+    @('SRV-B', 'Up to date',    'No'))
+Check "the watch was armed"                    (Start-BatchWatch -Kind 'Install' -Label 'Install all (parallel)' -Servers @('SRV-A','SRV-B'))
+Check "nothing is sent while one installs"     (-not (Step-BatchWatch))
+Set-PwRow 'SRV-A' 'Scanning...' '-'
+Check "nor while the confirming scan runs"     (-not (Step-BatchWatch))
+Set-PwRow 'SRV-A' 'Reboot Required' 'Yes'
+Check "then it is sent"                        (Step-BatchWatch)
+Check "as the install event"                   ($script:Sent[0].Event -eq 'Install')
+Check "with the summary"                       ($script:Sent[0].Summary -match 'Install all \(parallel\) finished')
+Check "the summary is in the log too"          ((Get-LoggedLike '*Install all (parallel) finished*').Count -eq 1)
+Check "and the watch is done"                  (-not (Step-BatchWatch))
+
+Case "a sequential run is not reported between servers"
+Reset-Watch
+Set-PwGrid @(,@('SRV-A', 'Up to date', 'No'))
+$script:Smtp = New-TestSmtp -Events @{ Reboot = $true }
+Start-BatchWatch -Kind 'Reboot' -Label 'Reboot all (sequential)' -Servers @('SRV-A') | Out-Null
+$script:RebootQueue.Enqueue('SRV-B')
+Check "not while the queue still has servers"  (-not (Step-BatchWatch))
+$script:RebootQueue.Clear()
+$script:ActiveJobs.Add([PSCustomObject]@{ Name = 'monitor' }) | Out-Null
+Check "nor while a monitor is still out"       (-not (Step-BatchWatch))
+$script:ActiveJobs.Clear()
+Check "only when both are done"                (Step-BatchWatch)
+
+Case "a run nobody wants mailed is not watched at all"
+Reset-Watch
+$script:Smtp = New-TestSmtp -Events @{ Install = $false }
+Check "the watch is not armed"                 (-not (Start-BatchWatch -Kind 'Install' -Label 'Install all' -Servers @('SRV-A')))
+Check "and nothing is carried"                 ($null -eq $script:BatchWatch)
+
+Remove-Item -LiteralPath $mailDir -Recurse -Force -ErrorAction SilentlyContinue
 
 
 # =============================================================================

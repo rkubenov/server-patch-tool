@@ -469,6 +469,8 @@ if (-not (Test-Path -LiteralPath $script:LogDir)) {
                     </ComboBox>
                     <Button x:Name="btnHeldBackKB" Content="Held-back KBs" FontSize="12" Margin="10,0,0,0"
                             ToolTip="Updates to skip on every install - for a cumulative that is known to fail here, or one waiting on a vendor fix"/>
+                    <Button x:Name="btnEmail" Content="Email..." FontSize="12" Margin="6,0,0,0"
+                            ToolTip="Send the result of a run by email, so a night window does not have to be read off this screen"/>
                 </WrapPanel>
 
                 <Border Height="1" Background="#313244" Margin="0,6"/>
@@ -1144,6 +1146,9 @@ function Step-AuthLockdown {
             "If the domain password was rotated, set the new one with Credentials > Change Password, " +
             "then confirm it with Test before starting again."
     Write-Log $text "ERROR"
+    # Before the message box: that one blocks until somebody clicks it, and by
+    # then the window it cost may be over.
+    Send-Notification -Event 'Halt' -Summary "Run halted: $reason" -Lines @($text) | Out-Null
     Show-AuthHaltNotice -Text $text
     return $true
 }
@@ -2032,6 +2037,7 @@ $script:JobTimer.Add_Tick({
     # Contained: this runs twice a second, and one bad tick must not take the
     # job handling above down with it.
     try { Step-PatchWindow } catch { Write-Log "Patch window: $($_.Exception.Message)" "ERROR" }
+    try { Step-BatchWatch | Out-Null } catch { Write-Log "Run report: $($_.Exception.Message)" "ERROR" }
 
     # Update progress
     if ($script:ActiveJobs.Count -eq 0) {
@@ -2284,6 +2290,10 @@ function Stop-AllOperations {
     # A schedule left armed after Stop would take servers down at night that
     # the operator had just asked the tool to leave alone.
     if ($script:PatchWindow) { Clear-PatchWindow -Reason $Reason }
+
+    # A stopped run has no result worth mailing as "finished". The halt itself
+    # is reported by the guard that raised it.
+    $script:BatchWatch = $null
 
     $stopped = $script:ActiveJobs.Count
     foreach ($job in @($script:ActiveJobs)) {
@@ -2801,6 +2811,9 @@ function Start-InstallBatch {
 
     Sync-RunspacePool
     Start-ProgressBatch -Total $Servers.Count
+    $what = if ($Label) { "Install $Label" } else { "Install all" }
+    Start-BatchWatch -Kind 'Install' -Label "$what$(if ($isSequential) { ' (sequential)' } else { ' (parallel)' })" `
+                     -Servers @($Servers.ServerName) | Out-Null
 
     if ($isSequential) {
         $script:SequentialQueue.Clear()
@@ -2974,6 +2987,9 @@ function Start-RebootBatch {
 
     Sync-RunspacePool
     Start-ProgressBatch -Total $Servers.Count
+    $what = if ($Label) { "Reboot $Label" } else { "Reboot all" }
+    Start-BatchWatch -Kind 'Reboot' -Label "$what$(if ($isSequential) { ' (sequential)' } else { ' (parallel)' })" `
+                     -Servers @($Servers.ServerName) | Out-Null
 
     if ($isSequential) {
         $script:RebootQueue.Clear()
@@ -3006,6 +3022,332 @@ $ui.btnRebootAll.Add_Click({
     Start-RebootBatch -Servers $servers -Label ""
 })
 
+# -- Email notifications ------------------------------------------------------
+# A night window is only useful if its result reaches someone. The report goes
+# to the log either way; this puts it in the operator's inbox as well.
+#
+# Sending never blocks the window and never fails a run: a dead relay is a WARN
+# in the log and nothing else, because the run itself was fine.
+$script:SmtpFile = Join-Path $script:CredDir "smtp.json"
+
+# The events that can be sent, in the order the dialog lists them.
+$script:NotifyEvents = @('PatchWindow', 'Halt', 'Install', 'Reboot')
+
+function New-SmtpConfig {
+    [PSCustomObject]@{
+        Enabled  = $false
+        Server   = ''
+        Port     = 25
+        UseSsl   = $false
+        From     = ''
+        To       = @()
+        AuthUser = ''            # empty means the relay is used anonymously
+        Password = $null         # SecureString, only when AuthUser is set
+        Events   = @{ PatchWindow = $true; Halt = $true; Install = $false; Reboot = $false }
+    }
+}
+
+$script:Smtp = New-SmtpConfig
+
+# Pure, so the rules can be argued with in the tests rather than at 2 a.m.
+function Test-SmtpConfig {
+    param($Config)
+
+    $problems = New-Object System.Collections.Generic.List[string]
+    if (-not $Config) {
+        return [PSCustomObject]@{ Ok = $false; Problems = @('there is no configuration at all') }
+    }
+    if (-not "$($Config.Server)".Trim()) { $problems.Add("the SMTP server is empty") | Out-Null }
+
+    $port = 0
+    if (-not [int]::TryParse("$($Config.Port)", [ref]$port) -or $port -lt 1 -or $port -gt 65535) {
+        $problems.Add("'$($Config.Port)' is not a port number") | Out-Null
+    }
+    # Deliberately not a full RFC check: it only has to catch a typo that the
+    # relay would reject anyway, such as a missing @ or a name with a space.
+    $looksLikeAddress = { param($a) "$a" -match '^[^@\s,;]+@[^@\s,;]+\.[^@\s,;]+$' }
+    if (-not (& $looksLikeAddress $Config.From)) {
+        $problems.Add("'$($Config.From)' is not an email address") | Out-Null
+    }
+    $to = @(@($Config.To) | Where-Object { "$_".Trim() })
+    if ($to.Count -eq 0) {
+        $problems.Add("there is no recipient") | Out-Null
+    } else {
+        foreach ($a in $to) {
+            if (-not (& $looksLikeAddress $a)) { $problems.Add("'$a' is not an email address") | Out-Null }
+        }
+    }
+    # Anonymous is a normal way to use an internal relay; half-filled
+    # credentials are not.
+    if ("$($Config.AuthUser)".Trim() -and -not $Config.Password) {
+        $problems.Add("a user name is set but no password") | Out-Null
+    }
+    return [PSCustomObject]@{ Ok = ($problems.Count -eq 0); Problems = [string[]]$problems.ToArray() }
+}
+
+# Splits what the dialog takes as one line into recipients.
+function ConvertTo-Recipients {
+    param([string]$Text)
+    $out = New-Object System.Collections.Generic.List[string]
+    foreach ($part in ("$Text" -split '[,;]')) {
+        $a = $part.Trim()
+        if ($a -and -not $out.Contains($a)) { $out.Add($a) | Out-Null }
+    }
+    return ,@($out.ToArray())
+}
+
+function Save-SmtpConfig {
+    try {
+        if (-not (Test-Path -LiteralPath $script:CredDir)) {
+            New-Item -ItemType Directory -Path $script:CredDir -Force | Out-Null
+        }
+        $c = $script:Smtp
+        # Same DPAPI treatment as the server credentials: the blob is worthless
+        # to another Windows account and on another machine.
+        $secret = if ($c.Password) { $c.Password | ConvertFrom-SecureString } else { '' }
+        ConvertTo-Json -Depth 3 -InputObject @{
+            Enabled  = [bool]$c.Enabled
+            Server   = "$($c.Server)"
+            Port     = [int]$c.Port
+            UseSsl   = [bool]$c.UseSsl
+            From     = "$($c.From)"
+            To       = @($c.To)
+            AuthUser = "$($c.AuthUser)"
+            Password = $secret
+            Events   = @{
+                PatchWindow = [bool]$c.Events.PatchWindow
+                Halt        = [bool]$c.Events.Halt
+                Install     = [bool]$c.Events.Install
+                Reboot      = [bool]$c.Events.Reboot
+            }
+        } | Set-Content -Path $script:SmtpFile -Encoding UTF8 -Force
+    } catch {
+        Write-Log "Could not save the email settings: $($_.Exception.Message)" "WARN"
+    }
+}
+
+function Load-SmtpConfig {
+    $script:Smtp = New-SmtpConfig
+    if (-not (Test-Path -LiteralPath $script:SmtpFile)) { return $script:Smtp }
+    try {
+        $raw = Get-Content -LiteralPath $script:SmtpFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        $c = New-SmtpConfig
+        $c.Enabled  = [bool]$raw.Enabled
+        $c.Server   = "$($raw.Server)"
+        $c.Port     = if ($raw.Port) { [int]$raw.Port } else { 25 }
+        $c.UseSsl   = [bool]$raw.UseSsl
+        $c.From     = "$($raw.From)"
+        $c.To       = @(@($raw.To) | Where-Object { "$_".Trim() } | ForEach-Object { "$_" })
+        $c.AuthUser = "$($raw.AuthUser)"
+        if ("$($raw.Password)") {
+            try {
+                $c.Password = ConvertTo-SecureString "$($raw.Password)" -ErrorAction Stop
+            } catch {
+                # Written by another account, or copied from another machine.
+                Write-Log "The saved SMTP password could not be decrypted - set it again in Email..." "WARN"
+                $c.AuthUser = ''
+            }
+        }
+        foreach ($e in $script:NotifyEvents) {
+            if ($null -ne $raw.Events.$e) { $c.Events[$e] = [bool]$raw.Events.$e }
+        }
+        $script:Smtp = $c
+        if ($c.Enabled) {
+            Write-Log "Email notifications are on: $($c.Server):$($c.Port) -> $(@($c.To) -join ', ')"
+        }
+    } catch {
+        Write-Log "The email settings could not be read and were ignored: $($_.Exception.Message)" "WARN"
+        $script:Smtp = New-SmtpConfig
+    }
+    return $script:Smtp
+}
+
+function Test-NotificationEvent {
+    param([string]$Event, $Config = $script:Smtp)
+    if (-not $Config -or -not $Config.Enabled) { return $false }
+    if (-not (Test-SmtpConfig -Config $Config).Ok) { return $false }
+    return [bool]$Config.Events[$Event]
+}
+
+# Subject and body, kept pure so the tests can read what an operator would.
+function New-NotificationMessage {
+    param(
+        [string]$Event,
+        [string]$Summary,
+        [string[]]$Lines = @(),
+        [string]$Computer = $env:COMPUTERNAME,
+        [datetime]$Now = (Get-Date)
+    )
+    # A subject that has to be readable on a phone, without opening it.
+    $subject = "[SPT] $Summary"
+    if ($subject.Length -gt 150) { $subject = $subject.Substring(0, 147) + "..." }
+
+    $body = New-Object System.Collections.Generic.List[string]
+    $body.Add($Summary) | Out-Null
+    if ($Lines.Count -gt 0) {
+        $body.Add("") | Out-Null
+        foreach ($l in $Lines) { $body.Add($l) | Out-Null }
+    }
+    $body.Add("") | Out-Null
+    $body.Add("--") | Out-Null
+    $body.Add("Server Patch Tool on $Computer, $($Now.ToString('yyyy-MM-dd HH:mm:ss'))") | Out-Null
+    $body.Add("Event: $Event. The full log is in logs\ServerPatchTool_$($Now.ToString('yyyyMMdd')).log on that computer.") | Out-Null
+
+    return [PSCustomObject]@{ Subject = $subject; Body = ($body -join "`r`n") }
+}
+
+# Runs in a runspace: a relay that does not answer costs a 30-second timeout,
+# and on the UI thread that is a frozen window.
+$script:SmtpSendScript = {
+    param([string]$Server, [int]$Port, [bool]$UseSsl, [string]$From, [string[]]$To,
+          [PSCredential]$Credential, [string]$Subject, [string]$Body)
+    try {
+        # Relays that still accept TLS 1.0 are getting rare, and .NET 4.x on
+        # Windows Server does not pick 1.2 on its own.
+        [Net.ServicePointManager]::SecurityProtocol =
+            [Net.SecurityProtocolType]::Tls12 -bor [Net.ServicePointManager]::SecurityProtocol
+
+        $client = New-Object System.Net.Mail.SmtpClient($Server, $Port)
+        $client.EnableSsl = $UseSsl
+        $client.Timeout   = 30000
+        if ($Credential) {
+            $client.UseDefaultCredentials = $false
+            $client.Credentials = New-Object System.Net.NetworkCredential(
+                $Credential.UserName, $Credential.GetNetworkCredential().Password)
+        }
+        $msg = New-Object System.Net.Mail.MailMessage
+        $msg.From = New-Object System.Net.Mail.MailAddress($From)
+        foreach ($a in $To) { $msg.To.Add($a) }
+        $msg.Subject = $Subject
+        $msg.Body    = $Body
+        try {
+            $client.Send($msg)
+        } finally {
+            $msg.Dispose()
+            $client.Dispose()
+        }
+        return [PSCustomObject]@{ Success = $true; Error = $null }
+    } catch {
+        # The inner exception is where the useful part lives: "5.7.1 Client was
+        # not authenticated" rather than "Failure sending mail".
+        $text = $_.Exception.Message
+        if ($_.Exception.InnerException) { $text += " - $($_.Exception.InnerException.Message)" }
+        return [PSCustomObject]@{ Success = $false; Error = $text }
+    }
+}
+
+function Get-SmtpCredential {
+    param($Config = $script:Smtp)
+    if (-not "$($Config.AuthUser)".Trim() -or -not $Config.Password) { return $null }
+    return (New-Object System.Management.Automation.PSCredential($Config.AuthUser, $Config.Password))
+}
+
+# Fire-and-forget. Returns $true when a message was handed to a job, so the
+# tests can tell "sent" from "not configured for this event".
+function Send-Notification {
+    param([string]$Event, [string]$Summary, [string[]]$Lines = @())
+
+    if (-not (Test-NotificationEvent -Event $Event)) { return $false }
+
+    $c   = $script:Smtp
+    $msg = New-NotificationMessage -Event $Event -Summary $Summary -Lines $Lines
+    Start-AsyncJob -ScriptBlock $script:SmtpSendScript `
+                   -Arguments @($c.Server, [int]$c.Port, [bool]$c.UseSsl, $c.From, [string[]]@($c.To),
+                                (Get-SmtpCredential), $msg.Subject, $msg.Body) `
+                   -OnComplete {
+        param($result)
+        Complete-Notification -Result ($result | Select-Object -First 1) -What "notification"
+    }.GetNewClosure()
+    return $true
+}
+
+# -- Watching a run started by hand -------------------------------------------
+# A parallel batch has no single completion point: every server finishes on its
+# own. So the run is watched the way the patch window is - by the job timer,
+# until nothing in the batch is busy any more.
+$script:BatchWatch = $null
+
+# Statuses that would make an operator look at that server in the morning.
+$script:AttentionStatuses = @("Error", "Blocked", "Offline", "Partially Online", "Cancelled",
+                              "Completed with errors", "Still installing", "Reboot issued",
+                              "Rebooting (unmonitored)", "Interrupted")
+
+function Start-BatchWatch {
+    param([string]$Kind, [string]$Label, [string[]]$Servers)
+    # Nothing to report to: do not carry state nobody reads.
+    if (-not (Test-NotificationEvent -Event $Kind)) { return $false }
+    $script:BatchWatch = [PSCustomObject]@{
+        Kind    = $Kind
+        Label   = $Label
+        Servers = [string[]]@($Servers)
+    }
+    return $true
+}
+
+# What the email says about a finished run. Reads the grid, which is the only
+# place the result of a run exists.
+function Get-BatchReport {
+    param([string]$Kind, [string]$Label, [string[]]$Servers)
+
+    $attention = New-Object System.Collections.Generic.List[string]
+    $awaiting  = New-Object System.Collections.Generic.List[string]
+    foreach ($name in @($Servers)) {
+        $entry = $script:ServerData | Where-Object { $_.ServerName -eq $name } | Select-Object -First 1
+        if (-not $entry) {
+            $attention.Add("$name : no longer in the server list") | Out-Null
+            continue
+        }
+        if ($entry.Status -in $script:AttentionStatuses) {
+            $detail = "$($entry.Details)"
+            if ($detail.Length -gt 200) { $detail = $detail.Substring(0, 200) + "..." }
+            $attention.Add("$name : $($entry.Status)$(if ($detail) { " - $detail" })") | Out-Null
+        } elseif ($entry.RebootRequired -eq "Yes") {
+            $awaiting.Add($name) | Out-Null
+        }
+    }
+
+    $n = @($Servers).Count
+    $summary = "$Label finished: $n server(s), $($attention.Count) need attention"
+    if ($Kind -eq 'Install') { $summary += ", $($awaiting.Count) awaiting a reboot" }
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    foreach ($a in $attention) { $lines.Add("needs attention - $a") | Out-Null }
+    if ($awaiting.Count -gt 0) { $lines.Add("awaiting a reboot: $(@($awaiting) -join ', ')") | Out-Null }
+
+    return [PSCustomObject]@{ Summary = $summary; Lines = [string[]]$lines.ToArray() }
+}
+
+# Driven by the job timer, like Step-PatchWindow.
+function Step-BatchWatch {
+    $w = $script:BatchWatch
+    if (-not $w) { return $false }
+    # A queue still holding servers means the run has not finished, even when
+    # nothing is busy at this instant - between two servers, briefly, nothing is.
+    if ($script:SequentialQueue.Count -gt 0 -or $script:RebootQueue.Count -gt 0) { return $false }
+    # A monitor or a confirming scan still out belongs to this run too.
+    if ($script:ActiveJobs.Count -gt 0) { return $false }
+    foreach ($name in $w.Servers) {
+        $entry = $script:ServerData | Where-Object { $_.ServerName -eq $name } | Select-Object -First 1
+        if ($entry -and $entry.Status -in $script:PatchWindowBusy) { return $false }
+    }
+
+    $script:BatchWatch = $null
+    $report = Get-BatchReport -Kind $w.Kind -Label $w.Label -Servers $w.Servers
+    Write-Log "$($report.Summary)"
+    return (Send-Notification -Event $w.Kind -Summary $report.Summary -Lines $report.Lines)
+}
+
+function Complete-Notification {
+    param($Result, [string]$What = "notification")
+    if ($Result -and $Result.Success) {
+        Write-Log "Email $What sent to $(@($script:Smtp.To) -join ', ')"
+        return $true
+    }
+    $why = if ($Result -and $Result.Error) { $Result.Error } else { "the send job returned nothing" }
+    # Never an ERROR: the run it reports on was fine, only the postman failed.
+    Write-Log "Email $What could not be sent: $why" "WARN"
+    return $false
+}
 # -- Patch window -------------------------------------------------------------
 # The routine this automates: the day before, scan and install in parallel; on
 # the night, reboot one server at a time. The first half starts straight away.
@@ -3364,6 +3706,13 @@ function Complete-PatchWindow {
     foreach ($s in @($pw.Skipped)) { Write-Log "  skipped - $($s.ServerName) : $($s.Reason)" }
     Update-StatusBar $summary
 
+    # The whole point of a night window is that nobody is watching it.
+    $mailLines = @(
+        @($attention | ForEach-Object { "needs attention - $_" }) +
+        @($pw.Skipped | ForEach-Object { "skipped - $($_.ServerName) : $($_.Reason)" })
+    )
+    Send-Notification -Event 'PatchWindow' -Summary $summary -Lines $mailLines | Out-Null
+
     $script:PatchWindow = $null
     Save-PatchWindow
     Save-ServerList
@@ -3680,6 +4029,222 @@ $ui.btnPatchWindow.Add_Click({
     Start-PatchWindow -Plan $plan
 })
 
+$script:SmtpXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Email Notifications" Width="540" SizeToContent="Height"
+        WindowStartupLocation="CenterOwner" ResizeMode="NoResize"
+        Background="#1e1e2e" Foreground="#cdd6f4" FontSize="13">
+    <Window.Resources>__RESOURCES__</Window.Resources>
+    <StackPanel Margin="16">
+        <CheckBox x:Name="chkMailEnabled" Content="Send the result of a run by email" Margin="0,0,0,10"
+                  ToolTip="Nothing is sent while this is off, whatever else is set here"/>
+
+        <Grid Margin="0,0,0,8">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="110"/>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="70"/>
+            </Grid.ColumnDefinitions>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+
+            <TextBlock Grid.Row="0" Grid.Column="0" Text="SMTP server:" Foreground="#a6adc8" VerticalAlignment="Center"/>
+            <TextBox   Grid.Row="0" Grid.Column="1" x:Name="txtMailServer" Margin="0,3" VerticalContentAlignment="Center"
+                       ToolTip="Host name of the relay, e.g. smtp.example.local"/>
+            <TextBlock Grid.Row="0" Grid.Column="2" Text="Port:" Foreground="#a6adc8" VerticalAlignment="Center" Margin="10,0,6,0"/>
+            <TextBox   Grid.Row="0" Grid.Column="3" x:Name="txtMailPort" Margin="0,3" VerticalContentAlignment="Center"/>
+
+            <TextBlock Grid.Row="1" Grid.Column="0" Text="From:" Foreground="#a6adc8" VerticalAlignment="Center"/>
+            <TextBox   Grid.Row="1" Grid.Column="1" Grid.ColumnSpan="3" x:Name="txtMailFrom" Margin="0,3"
+                       VerticalContentAlignment="Center" ToolTip="The address the mail is sent as"/>
+
+            <TextBlock Grid.Row="2" Grid.Column="0" Text="To:" Foreground="#a6adc8" VerticalAlignment="Center"/>
+            <TextBox   Grid.Row="2" Grid.Column="1" Grid.ColumnSpan="3" x:Name="txtMailTo" Margin="0,3"
+                       VerticalContentAlignment="Center" ToolTip="One or more addresses, separated by commas"/>
+        </Grid>
+
+        <CheckBox x:Name="chkMailSsl" Content="Use TLS (usually port 587)" Margin="0,0,0,10"/>
+
+        <TextBlock Text="Relay authentication:" Foreground="#a6adc8" Margin="0,0,0,4"/>
+        <RadioButton x:Name="rbMailAnon" Content="Anonymous" IsChecked="True" Foreground="#cdd6f4" Margin="0,2"
+                     VerticalContentAlignment="Center" ToolTip="Internal relays usually accept mail from a known host without a password"/>
+        <RadioButton x:Name="rbMailAuth" Content="User name and password" Foreground="#cdd6f4" Margin="0,2"
+                     VerticalContentAlignment="Center"/>
+        <Grid Margin="20,4,0,10">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="100"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+            <TextBlock Grid.Row="0" Grid.Column="0" Text="User:" Foreground="#a6adc8" VerticalAlignment="Center"/>
+            <TextBox   Grid.Row="0" Grid.Column="1" x:Name="txtMailUser" Margin="0,3" VerticalContentAlignment="Center"/>
+            <TextBlock Grid.Row="1" Grid.Column="0" Text="Password:" Foreground="#a6adc8" VerticalAlignment="Center"/>
+            <PasswordBox Grid.Row="1" Grid.Column="1" x:Name="pwdMail" Margin="0,3" Padding="6,4"
+                         Background="#313244" Foreground="#cdd6f4" BorderBrush="#585b70"
+                         ToolTip="Stored encrypted for this Windows account on this computer only"/>
+        </Grid>
+
+        <TextBlock Text="Send an email when:" Foreground="#a6adc8" Margin="0,0,0,4"/>
+        <CheckBox x:Name="chkMailPatchWindow" Content="A patch window finishes" Margin="0,2"
+                  ToolTip="The morning report: rebooted, clean, need attention, skipped"/>
+        <CheckBox x:Name="chkMailHalt" Content="A run is halted because logons are being rejected" Margin="0,2"
+                  ToolTip="Without this, a halted night window is only a silence"/>
+        <CheckBox x:Name="chkMailInstall" Content="An install started by hand finishes" Margin="0,2"/>
+        <CheckBox x:Name="chkMailReboot" Content="A reboot started by hand finishes" Margin="0,2"/>
+
+        <TextBlock x:Name="txtMailError" Foreground="#f38ba8" TextWrapping="Wrap" Margin="0,10,0,0"/>
+
+        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,10,0,0">
+            <Button x:Name="btnMailTest" Content="Send test" ToolTip="Sends one message with these settings, right now"/>
+            <Button x:Name="btnMailOk" Content="Save" Style="{StaticResource AccentButton}" IsDefault="True"/>
+            <Button x:Name="btnMailCancel" Content="Cancel" IsCancel="True"/>
+        </StackPanel>
+    </StackPanel>
+</Window>
+'@
+
+# Builds a config object out of what the dialog currently shows. Separate from
+# the dialog so the same parsing is used by Save and by Send test.
+function Read-SmtpDialog {
+    param($Controls, $Current)
+    $c = New-SmtpConfig
+    $c.Enabled  = [bool]$Controls.chkMailEnabled.IsChecked
+    $c.Server   = $Controls.txtMailServer.Text.Trim()
+    $c.Port     = $Controls.txtMailPort.Text.Trim()
+    $c.UseSsl   = [bool]$Controls.chkMailSsl.IsChecked
+    $c.From     = $Controls.txtMailFrom.Text.Trim()
+    $c.To       = ConvertTo-Recipients -Text $Controls.txtMailTo.Text
+    if ($Controls.rbMailAuth.IsChecked) {
+        $c.AuthUser = $Controls.txtMailUser.Text.Trim()
+        # An empty password box means "keep the stored one": the dialog never
+        # shows a password back, so typing nothing must not erase it.
+        if ($Controls.pwdMail.SecurePassword.Length -gt 0) {
+            $c.Password = $Controls.pwdMail.SecurePassword.Copy()
+            $c.Password.MakeReadOnly()
+        } elseif ($Current -and "$($Current.AuthUser)" -eq $c.AuthUser) {
+            $c.Password = $Current.Password
+        }
+    }
+    foreach ($e in $script:NotifyEvents) {
+        $c.Events[$e] = [bool]$Controls["chkMail$e"].IsChecked
+    }
+    return $c
+}
+
+function Show-SmtpDialog {
+    $resources = $xaml.DocumentElement.ChildNodes |
+        Where-Object { $_.LocalName -eq 'Window.Resources' } | Select-Object -First 1
+    [xml]$dx = $script:SmtpXaml.Replace('__RESOURCES__', $resources.InnerXml)
+    $dlg = [Windows.Markup.XamlReader]::Load([System.Xml.XmlNodeReader]::new($dx))
+    $dlg.Owner = $window
+
+    $c = @{}
+    foreach ($n in 'chkMailEnabled', 'txtMailServer', 'txtMailPort', 'txtMailFrom', 'txtMailTo',
+                   'chkMailSsl', 'rbMailAnon', 'rbMailAuth', 'txtMailUser', 'pwdMail',
+                   'chkMailPatchWindow', 'chkMailHalt', 'chkMailInstall', 'chkMailReboot',
+                   'txtMailError', 'btnMailTest', 'btnMailOk', 'btnMailCancel') {
+        $c[$n] = $dlg.FindName($n)
+    }
+
+    $current = $script:Smtp
+    $c.chkMailEnabled.IsChecked = [bool]$current.Enabled
+    $c.txtMailServer.Text       = "$($current.Server)"
+    $c.txtMailPort.Text         = "$($current.Port)"
+    $c.txtMailFrom.Text         = "$($current.From)"
+    $c.txtMailTo.Text           = (@($current.To) -join ', ')
+    $c.chkMailSsl.IsChecked     = [bool]$current.UseSsl
+    $c.txtMailUser.Text         = "$($current.AuthUser)"
+    if ("$($current.AuthUser)".Trim()) { $c.rbMailAuth.IsChecked = $true }
+    foreach ($e in $script:NotifyEvents) { $c["chkMail$e"].IsChecked = [bool]$current.Events[$e] }
+
+    # The handlers below are closures: an assignment to a $script: variable in
+    # one of them sets a copy nobody reads, and a function called from one sees
+    # the same emptiness. So the dialog only fills this hashtable - mutating an
+    # object does work - and the saving happens out here, in the function.
+    $state = @{ Saved = $false; Config = $null }
+
+    $c.btnMailTest.Add_Click({
+        $cfg = Read-SmtpDialog -Controls $c -Current $current
+        $verdict = Test-SmtpConfig -Config $cfg
+        if (-not $verdict.Ok) {
+            $c.txtMailError.Text = "Cannot send a test: $($verdict.Problems -join '; ')."
+            return
+        }
+        $c.txtMailError.Text = "Sending..."
+        Send-TestNotification -Config $cfg
+    }.GetNewClosure())
+
+    $c.btnMailOk.Add_Click({
+        $cfg = Read-SmtpDialog -Controls $c -Current $current
+        # Half-filled settings are only refused when they would be used.
+        if ($cfg.Enabled) {
+            $verdict = Test-SmtpConfig -Config $cfg
+            if (-not $verdict.Ok) {
+                $c.txtMailError.Text = "$($verdict.Problems -join '; ')."
+                return
+            }
+        }
+        $state.Config = $cfg
+        $state.Saved  = $true
+        $dlg.DialogResult = $true
+    }.GetNewClosure())
+
+    $dlg.ShowDialog() | Out-Null
+    if (-not $state.Saved) { return $false }
+    $script:Smtp = $state.Config
+    Save-SmtpConfig
+    return $true
+}
+
+# The test send is deliberately the real thing: same job, same script block, so
+# a relay that refuses the real mail refuses this too.
+function Send-TestNotification {
+    param($Config)
+    $msg = New-NotificationMessage -Event 'Test' `
+        -Summary "Test message from Server Patch Tool" `
+        -Lines @("If this arrived, the settings work. Nothing was patched or rebooted to send it.")
+    Write-Log "Sending a test email to $(@($Config.To) -join ', ')..."
+    Start-AsyncJob -ScriptBlock $script:SmtpSendScript `
+                   -Arguments @($Config.Server, [int]$Config.Port, [bool]$Config.UseSsl, $Config.From,
+                                [string[]]@($Config.To), (Get-SmtpCredential -Config $Config),
+                                $msg.Subject, $msg.Body) `
+                   -OnComplete {
+        param($result)
+        $r = $result | Select-Object -First 1
+        Complete-Notification -Result $r -What "test" | Out-Null
+        if ($r -and $r.Success) {
+            [System.Windows.MessageBox]::Show(
+                "The test message was accepted by the relay. Check the inbox.",
+                "Email Notifications", "OK", "Information") | Out-Null
+        } else {
+            $why = if ($r -and $r.Error) { $r.Error } else { "the send job returned nothing" }
+            [System.Windows.MessageBox]::Show(
+                "The test message was not sent:`n`n$why",
+                "Email Notifications", "OK", "Warning") | Out-Null
+        }
+    }.GetNewClosure()
+}
+
+$ui.btnEmail.Add_Click({
+    if (Show-SmtpDialog) {
+        $c = $script:Smtp
+        if ($c.Enabled) {
+            $events = @($script:NotifyEvents | Where-Object { $c.Events[$_] })
+            Write-Log "Email notifications on: $($c.Server):$($c.Port) -> $(@($c.To) -join ', '); events: $(@($events) -join ', ')"
+        } else {
+            Write-Log "Email notifications off"
+        }
+    }
+})
+
 $ui.btnCancelPatchWindow.Add_Click({
     if (-not $script:PatchWindow) { return }
     $confirm = [System.Windows.MessageBox]::Show(
@@ -3977,6 +4542,9 @@ Load-ServerList
 
 # And whatever the operator has decided not to install
 Load-ExcludedKB | Out-Null
+
+# Where the results of a run should be sent, if anywhere
+Load-SmtpConfig | Out-Null
 
 # Restore saved credentials. Setting the checkbox fires Add_Checked, which
 # re-saves the same data - harmless, and it keeps the box honest about state.

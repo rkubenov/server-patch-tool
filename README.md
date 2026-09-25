@@ -15,6 +15,7 @@ A PowerShell + WPF desktop tool for driving Windows Updates across domain-joined
 - A stale stored password is caught before a run, and stops one before it locks the account
 - Named updates held back across every install, and a pre-flight that refuses an install that cannot succeed
 - A patch window: scan and install now, then reboot one by one, in your order, at a time you choose — including servers patched outside this tool, which only need the reboot
+- Email by SMTP when a run finishes or is halted, so a night window is not read off one screen
 - Export results to CSV
 
 ## Requirements
@@ -113,6 +114,26 @@ Other things to know:
 - **Stop** also cancels the plan, and so does the password guard halting a run.
 - A reboot run started by hand when the time comes is not interrupted. The window waits for it to finish.
 
+## Email notifications
+
+A night window is only useful if its result reaches someone, and the report otherwise lives on one screen. **Email...** in the toolbar sets up an SMTP relay and picks which runs are worth a message:
+
+| Event | Sent when | Subject looks like |
+|---|---|---|
+| A patch window finishes | The morning report, after the last reboot and its scan | `[SPT] Patch window finished: 4 rebooted, 2 clean, 2 need attention, 1 skipped` |
+| A run is halted | The stale-password guard stopped a run before the domain lockout policy did | `[SPT] Run halted: 2 logons in a row were rejected` |
+| An install started by hand finishes | Install Selected/All, parallel or sequential | `[SPT] Install all (parallel) finished: 5 server(s), 1 need attention, 3 awaiting a reboot` |
+| A reboot started by hand finishes | Reboot Selected/All, parallel or sequential | `[SPT] Reboot all (sequential) finished: 4 server(s), 1 need attention` |
+
+The body repeats the summary, then one line per server that needs looking at — with the status and the reason — and, for an install, which servers are waiting on a reboot. Servers that came out clean are not listed: a short mail gets read.
+
+- **The relay may be anonymous or authenticated.** Anonymous is the usual case for an internal relay that accepts mail from a known host. With a user name and password, the password is stored the same way the server credentials are: encrypted with DPAPI for this Windows account on this computer. Leaving the password box empty when editing keeps the stored one.
+- **Nothing blocks a run.** Sending happens in the same runspace pool as everything else, so a relay that does not answer costs no time in the window, and a refused message is a `WARN` in the log — never a failed run. The report is in the log either way.
+- **Send test** uses the settings on screen and the same code path as the real mail, so a relay that would refuse the night's message refuses the test too.
+- **Settings that cannot work are refused when saved**, not at 2 a.m.: no server, a port that is not a number, an address without an `@`, no recipient, or a user name with no password.
+- **A parallel run has no single end**, so the tool watches it the way it watches a patch window: the mail goes out once nothing in the batch is busy and no confirming scan or reboot watch is still out. Pressing **Stop** cancels the report — a stopped run has no result worth mailing.
+- **What leaves the machine:** server names, statuses, KB numbers. Fine for an internal relay; worth a thought if the mail goes to a cloud mailbox.
+
 ## Where data lives
 
 | What | Where | Note |
@@ -122,6 +143,7 @@ Other things to know:
 | Credentials | `%LOCALAPPDATA%\ServerPatchTool\credentials.json` | Only with "Remember" ticked |
 | Held-back KBs | `%LOCALAPPDATA%\ServerPatchTool\excluded-kb.json` | Removed when the list is cleared |
 | Scheduled patch window | `%LOCALAPPDATA%\ServerPatchTool\patch-window.json` | Removed when the window ends or is cancelled |
+| Email settings | `%LOCALAPPDATA%\ServerPatchTool\smtp.json` | Any relay password is DPAPI-encrypted, as in `credentials.json` |
 
 `servers.json` format:
 
@@ -177,9 +199,9 @@ Parses the main file, loads the XAML markup (the main window, and the patch-wind
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File _tests.ps1
 ```
 
-Behavioural tests — 384 checks, no live server and no window required. The tool is a single file that builds a window as it loads, so it cannot simply be dot-sourced; instead each unit under test is located in the real file with the PowerShell parser and evaluated on its own against stubs. That way the shipped code is exercised rather than a copy of it, and a test fails loudly if the code it targets is renamed or moved.
+Behavioural tests — 456 checks, no live server and no window required. The tool is a single file that builds a window as it loads, so it cannot simply be dot-sourced; instead each unit under test is located in the real file with the PowerShell parser and evaluated on its own against stubs. That way the shipped code is exercised rather than a copy of it, and a test fails loudly if the code it targets is renamed or moved.
 
-Covered: the job completion timer, install reporting, credential selection, removal and password changes, the stale-password guard and the credential test, held-back updates and the install pre-flight, the post-reboot monitor and how it is launched, the sequential queues, deferred re-checks, both time limits, and the patch window (plan validation and its three modes, who is rebooted and in what order, the phases and the reboot time, the scan-before-next hand-over, the morning report, saving and restoring the plan — mode included, and older files without one — and Stop disarming it).
+Covered: the job completion timer, install reporting, credential selection, removal and password changes, the stale-password guard and the credential test, held-back updates and the install pre-flight, the post-reboot monitor and how it is launched, the sequential queues, deferred re-checks, both time limits, and the patch window (plan validation and its three modes, who is rebooted and in what order, the phases and the reboot time, the scan-before-next hand-over, the morning report, saving and restoring the plan — mode included, and older files without one — and Stop disarming it), and the email notifications (settings validation and storage, which events are sent, the message an operator gets, when a run counts as finished, and a refused send staying a warning).
 
 > [!IMPORTANT]
 > `.ps1` files are stored **without a BOM**, so PowerShell 5.1 reads them in the system's single-byte code page. Code and strings must stay ASCII. The validator checks this.
